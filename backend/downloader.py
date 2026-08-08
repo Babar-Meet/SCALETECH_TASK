@@ -2,6 +2,7 @@ import os
 import re
 import time
 import asyncio
+import json
 from typing import Optional
 import yt_dlp
 from sqlalchemy.orm import Session
@@ -62,7 +63,7 @@ def download_audio(url: str, output_dir: str):
         # Let's actually force our safe filename format in yt-dlp outtmpl to be perfectly sure.
         pass
         
-def download_audio_safe(url: str, video_id: str, output_dir: str):
+def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int = None, loop=None, manager=None):
     # It's better to extract info first, then download with our explicit filename
     ydl_opts_info = {
         'quiet': True,
@@ -78,6 +79,18 @@ def download_audio_safe(url: str, video_id: str, output_dir: str):
     safe_name = sanitize_filename(title, video_id)
     outtmpl = os.path.join(output_dir, f"{safe_name}.%(ext)s")
     
+    def my_hook(d):
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', '').strip()
+            if percent and link_id and loop and manager:
+                try:
+                    # _percent_str often looks like " 45.6%" or " \x1b[0;94m 45.6%\x1b[0m"
+                    clean_percent = re.sub(r'\x1b[^m]*m', '', percent)
+                    msg = json.dumps({"type": "progress", "id": link_id, "percent": clean_percent})
+                    asyncio.run_coroutine_threadsafe(manager.broadcast(msg), loop)
+                except Exception:
+                    pass
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': outtmpl,
@@ -88,6 +101,7 @@ def download_audio_safe(url: str, video_id: str, output_dir: str):
         }],
         'quiet': True,
         'no_warnings': True,
+        'progress_hooks': [my_hook],
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -115,6 +129,8 @@ async def download_loop():
             # Mark as DOWNLOADING
             link.status = "DOWNLOADING"
             db.commit()
+            from websocket_manager import manager
+            await manager.broadcast("update")
             
             try:
                 # Execute download
@@ -127,11 +143,16 @@ async def download_loop():
                 if not os.path.exists(target_dir):
                     os.makedirs(target_dir, exist_ok=True)
                     
+                from websocket_manager import manager
+                loop = asyncio.get_running_loop()
                 path, title, channel, duration = await asyncio.to_thread(
                     download_audio_safe,
                     link.normalized_url, 
                     link.youtube_video_id, 
-                    target_dir
+                    target_dir,
+                    link.id,
+                    loop,
+                    manager
                 )
                 
                 link.audio_path = path
@@ -146,6 +167,8 @@ async def download_loop():
                 link.error = str(e)
                 
             db.commit()
+            from websocket_manager import manager
+            await manager.broadcast("update")
         except Exception as e:
             print(f"Error in download loop: {e}")
             await asyncio.sleep(2)

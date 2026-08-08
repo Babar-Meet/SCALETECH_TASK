@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 import zipfile
 from pydantic import BaseModel
 from typing import List, Optional
+from fastapi import WebSocket, WebSocketDisconnect
+from websocket_manager import manager
 
 from config import config
 from database import SessionLocal, Link
@@ -17,7 +19,7 @@ app = FastAPI(title="WhatsApp to YouTube Music Extractor MVP")
 
 @app.on_event("startup")
 async def startup_event():
-    start_download_loop()
+    pass # Wait for user to manually trigger downloads from the UI
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -139,6 +141,8 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             extracted_url=res['extracted_url'],
             normalized_url=res['normalized_url'],
             youtube_video_id=res['youtube_video_id'],
+            audio_title=res.get('audio_title'),
+            channel_name=res.get('channel_name'),
             status="PENDING" if res['youtube_video_id'] and not is_duplicate else ("SKIPPED_NON_YOUTUBE" if not res['youtube_video_id'] else "DUPLICATE")
         )
         db.add(db_link)
@@ -175,15 +179,32 @@ def clear_all_links(db: Session = Depends(get_db)):
     # Optionally clear the imported directories, but DB clear is minimum.
     return {"message": "All links cleared"}
 
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
 @app.post("/api/downloads/start")
-def start_downloads():
+async def start_downloads():
     start_download_loop()
+    await manager.broadcast("update")
     return {"message": "Download loop started"}
 
 @app.post("/api/downloads/pause")
-def pause_downloads():
+async def pause_downloads():
     stop_download_loop()
+    await manager.broadcast("update")
     return {"message": "Download loop paused"}
+
+@app.get("/api/downloads/status")
+def get_download_status():
+    from downloader import download_loop_running
+    return {"is_running": download_loop_running}
 
 @app.post("/api/downloads/retry/{link_id}")
 def retry_download(link_id: int, db: Session = Depends(get_db)):

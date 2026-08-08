@@ -18,16 +18,44 @@ export default function DownloadsPage() {
   const [downloads, setDownloads] = useState<DownloadData[]>([]);
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState<any>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [progressMap, setProgressMap] = useState<Record<number, string>>({});
 
   useEffect(() => {
     fetchDownloads();
     fetchStats();
-    const interval = setInterval(() => {
-      fetchDownloads();
-      fetchStats();
-    }, 3000);
-    return () => clearInterval(interval);
+    fetchStatus();
+    
+    const ws = new WebSocket('ws://localhost:8000/api/ws');
+    
+    ws.onmessage = (event) => {
+      if (event.data === 'update') {
+        fetchDownloads();
+        fetchStats();
+        fetchStatus();
+      } else {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'progress') {
+            setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
+          }
+        } catch (e) {}
+      }
+    };
+
+    return () => {
+      ws.close();
+    };
   }, []);
+
+  const fetchStatus = async () => {
+    try {
+      const res = await axios.get('http://localhost:8000/api/downloads/status');
+      setIsRunning(res.data.is_running);
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   const fetchDownloads = async () => {
     try {
@@ -50,10 +78,12 @@ export default function DownloadsPage() {
   };
 
   const startLoop = async () => {
+    setIsRunning(true);
     await axios.post('http://localhost:8000/api/downloads/start');
   };
 
   const pauseLoop = async () => {
+    setIsRunning(false);
     await axios.post('http://localhost:8000/api/downloads/pause');
   };
 
@@ -65,13 +95,31 @@ export default function DownloadsPage() {
   return (
     <div>
       <div className="row-header">
-        <h1>Downloads</h1>
+        <div style={{display: 'flex', alignItems: 'center', gap: '16px'}}>
+          <h1>Downloads</h1>
+          {isRunning && (
+            <div style={{display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--match-score)', fontSize: '14px', fontWeight: 'bold'}}>
+              <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: 'var(--match-score)', animation: 'pulse 1.5s infinite'}}></div>
+              Processing Active
+            </div>
+          )}
+        </div>
         <div style={{display: 'flex', gap: '16px'}}>
-          <button className="btn btn-play" onClick={startLoop}>
-            <Play size={18} fill="currentColor" /> Start Background DL
+          <button 
+            className="btn btn-play" 
+            onClick={startLoop}
+            disabled={isRunning}
+            style={{ opacity: isRunning ? 0.5 : 1, cursor: isRunning ? 'not-allowed' : 'pointer' }}
+          >
+            <Play size={18} fill="currentColor" /> {isRunning ? 'Running...' : 'Process All'}
           </button>
-          <button className="btn" onClick={pauseLoop}>
-            <Pause size={18} fill="currentColor" /> Pause
+          <button 
+            className="btn" 
+            onClick={pauseLoop}
+            disabled={!isRunning}
+            style={{ opacity: !isRunning ? 0.5 : 1, cursor: !isRunning ? 'not-allowed' : 'pointer' }}
+          >
+            <Pause size={18} fill={!isRunning ? 'none' : 'currentColor'} /> Pause
           </button>
         </div>
       </div>
@@ -104,7 +152,9 @@ export default function DownloadsPage() {
                 
                 <div className="card-info">
                   <div className="card-meta" style={{justifyContent: 'space-between', marginBottom: '4px'}}>
-                    <span className={`badge ${dl.status.toLowerCase()}`}>{dl.status}</span>
+                    <span className={`badge ${dl.status.toLowerCase()}`}>
+                      {dl.status === 'DOWNLOADING' && progressMap[dl.id] ? `DOWNLOADING (${progressMap[dl.id]})` : dl.status}
+                    </span>
                     <span>{dl.duration ? `${dl.duration}s` : ''}</span>
                   </div>
 

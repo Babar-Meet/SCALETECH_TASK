@@ -67,6 +67,29 @@ def parse_whatsapp_chat(filepath: str):
     if current_message:
         yield current_message
 
+import urllib.request
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def fetch_youtube_metadata(url, video_id):
+    metadata = {
+        'audio_title': None,
+        'channel_name': None
+    }
+    if not video_id:
+        return metadata
+        
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        req = urllib.request.Request(oembed_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            metadata['audio_title'] = data.get('title')
+            metadata['channel_name'] = data.get('author_name')
+    except Exception as e:
+        print(f"Failed to fetch metadata for {video_id}: {e}")
+    return metadata
+
 def process_chat_file(filepath: str):
     results = []
     try:
@@ -77,6 +100,7 @@ def process_chat_file(filepath: str):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "python-dateutil"])
         import dateutil.parser
 
+    raw_items = []
     for msg in parse_whatsapp_chat(filepath):
         urls = extract_urls(msg['message'])
         for url in urls:
@@ -86,7 +110,7 @@ def process_chat_file(filepath: str):
             except:
                 date_obj = datetime.utcnow()
                 
-            results.append({
+            raw_items.append({
                 'message_date': date_obj,
                 'sender': msg['sender'],
                 'original_message': msg['message'],
@@ -94,4 +118,25 @@ def process_chat_file(filepath: str):
                 'normalized_url': normalized,
                 'youtube_video_id': video_id
             })
+            
+    # Fetch metadata concurrently
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_item = {
+            executor.submit(fetch_youtube_metadata, item['normalized_url'], item['youtube_video_id']): item 
+            for item in raw_items
+        }
+        
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            try:
+                meta = future.result()
+                item['audio_title'] = meta['audio_title']
+                item['channel_name'] = meta['channel_name']
+            except Exception:
+                item['audio_title'] = None
+                item['channel_name'] = None
+            results.append(item)
+            
+    # Sort results back by date to keep it somewhat chronological
+    results.sort(key=lambda x: x['message_date'])
     return results

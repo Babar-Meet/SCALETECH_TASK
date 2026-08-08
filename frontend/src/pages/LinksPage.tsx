@@ -18,10 +18,47 @@ export default function LinksPage() {
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [editingCategory, setEditingCategory] = useState<{id: number, value: string} | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [progressMap, setProgressMap] = useState<Record<number, string>>({});
 
   useEffect(() => {
     fetchLinks();
+    fetchStatus();
+    
+    const ws = new WebSocket('ws://localhost:8000/api/ws');
+    
+    ws.onmessage = (event) => {
+      if (event.data === 'update') {
+        fetchLinks();
+        fetchStatus();
+      } else {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'progress') {
+            setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
+          }
+        } catch (e) {}
+      }
+    };
+
+    return () => {
+      ws.close();
+    };
   }, []);
+
+  const fetchStatus = async () => {
+    try {
+      const res = await axios.get('http://localhost:8000/api/downloads/status');
+      setIsRunning(res.data.is_running);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const startLoop = async () => {
+    setIsRunning(true);
+    await axios.post('http://localhost:8000/api/downloads/start');
+  };
 
   const fetchLinks = async () => {
     try {
@@ -75,8 +112,24 @@ export default function LinksPage() {
   return (
     <div>
       <div className="row-header">
-        <h1>My List</h1>
+        <div style={{display: 'flex', alignItems: 'center', gap: '16px'}}>
+          <h1>My List</h1>
+          {isRunning && (
+            <div style={{display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--match-score)', fontSize: '14px', fontWeight: 'bold'}}>
+              <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: 'var(--match-score)', animation: 'pulse 1.5s infinite'}}></div>
+              Processing Active
+            </div>
+          )}
+        </div>
         <div style={{display: 'flex', gap: '16px'}}>
+          <button 
+            className="btn btn-play" 
+            onClick={startLoop}
+            disabled={isRunning}
+            style={{ opacity: isRunning ? 0.5 : 1, cursor: isRunning ? 'not-allowed' : 'pointer' }}
+          >
+            <DownloadCloud size={18} fill="currentColor" /> {isRunning ? 'Processing...' : 'Process'}
+          </button>
           <button className="btn" onClick={clearAll} style={{color: 'var(--netflix-red)'}}>
             <Trash2 size={18} />
             Remove All
@@ -108,7 +161,9 @@ export default function LinksPage() {
                 
                 <div className="card-info">
                   <div className="card-meta" style={{justifyContent: 'space-between', marginBottom: '4px'}}>
-                    <span className="match-score">{link.status}</span>
+                    <span className={`match-score badge ${link.status.toLowerCase()}`}>
+                      {link.status === 'DOWNLOADING' && progressMap[link.id] ? `DOWNLOADING (${progressMap[link.id]})` : link.status}
+                    </span>
                     <span>{link.channel_name || 'Unknown Channel'}</span>
                   </div>
                   
