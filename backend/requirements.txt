@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+openpyxl
+pydantic
+python-multipart
+sqlalchemy
+yt-dlp
+python-dateutil

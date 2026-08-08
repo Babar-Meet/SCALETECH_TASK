@@ -1,0 +1,699 @@
+i just what app messages
+
+
+
+lnk title chanalname duraction 
+
+
+
+i have what app chat of two perole
+i want to extract the mmessage and link form it
+and make a exel like this was send by this person and this was send by this person maybe a group chat but usually a one to two person chat lets keep it robust
+
+then we get exel file for user and link now we will use that exel and give it to yt-dlp and save the audio only no video for all link 
+
+
+and also make sure it shuld retry and start from last time it stop not starting from start so shuld some how mantain the complited one and skip them if neeed
+
+
+
+then we build another exel like this
+url sender sname
+url or say link
+audio title(this need some safe guard like special cchars and thing) 
+chanalname 
+audio duraction 
+
+
+now outside work is done now lest play locally like files moving and thing creting dir
+
+then song are their locally then we expacted catagoire and path let user create the love song folder if they want and then we preoss it again to restructor them like creting fodler and creating over all struckor so we can quicly take song to pendrive if needed
+
+
+
+
+so bascaill we have what app chat(maybe we export it and then preoss it to generate exel file)
+then we use that porecess it with yt-dlp like from generated or process exel we start downlad then locally
+
+right now we will save then as a user name like if meet send the link it goes to meet folder and if raju send something it goes to this name folder
+
+make sure it have retur and resume from last time end feature
+
+
+then we have eveyhting localy with exel as report then we go locally
+
+extract the lirix and things from the auio using wisper and feed lyrex to locally running or groq movel to get the song catagores like love or phonk etc make sure it does not dubllicats or some thing Panjabi love song shuld not be ambeguas it have language as Panjabi and type as love
+
+
+
+then we verify this generate catagories and restructure it locally for quick backup or for the best user expirenace
+
+
+
+
+
+
+--------------------------------------------------------------------------------------
+Fist prompt
+--------------------------------------------------------------------------------------
+# WhatsApp → YouTube Music Extractor — MVP Build Spec (FINAL / v3)
+
+## What changed since v2 (for you, not the agent)
+
+- Added a real Configuration section — `.env`-driven, Gemini key optional at build time, nothing hardcoded.
+- Made "one bad item can't stop the pipeline" and "every stage gets independent retry" explicit architecture rules, not just implied by the status columns.
+- Corrected the phase plan so **each phase ships its own minimal UI** — UI is not a final phase 6.
+- Corrected the concurrency model to **three independent per-stage loops** (download / transcribe / classify) running concurrently with each other — required for the live per-stage dashboard to even make sense.
+- Made the Organizer's preview→Apply flow concrete with a worked example.
+
+---
+
+## Instructions to the coding agent — paste this with the spec below
+
+> Build this MVP end-to-end, but incrementally. Implement and fully verify one phase at a time — each phase includes both its backend logic and the minimal UI screen needed to see and use it. Do not defer all UI to the end. Do not wait for a Gemini API key to start building: read it from an environment variable, and make classification gracefully unavailable (not crashing, not blocking anything else) until the key is supplied. Do not write the whole application in one pass — stop for review at the end of each phase below.
+
+* **Phase 1** — WhatsApp import: multi-line/system-message-aware parser → URL extraction → SQLite → Excel export → working Import + Links pages. Verify URL extraction thoroughly (Section 15) before continuing.
+* **Phase 2** — Download: SQLite → yt-dlp (sequential, audio-only) → resume/retry → working Downloads page.
+* **Phase 3** — Transcription: audio → faster-whisper → transcript cache → transcription status/retry.
+* **Phase 4** — Classification: transcript + metadata → Gemini structured JSON → classification status/retry → gracefully skipped with no key.
+* **Phase 5** — Organization: preview → user override → Apply → move files.
+* **Phase 6** — Dashboard: tie the per-stage live counts already built in phases 1–5 into one overview page.
+
+---
+
+## Goal
+
+The application is for personal/internal use on one PC (Windows). Keep the architecture simple. Do NOT use MongoDB, Firebase, PostgreSQL, Redis, Docker, microservices, authentication, or unnecessary enterprise infrastructure.
+
+### Tech stack
+
+* Frontend: React + TypeScript + Vite
+* Backend: Python + FastAPI
+* Database: SQLite
+* YouTube downloading: yt-dlp
+* Audio conversion: FFmpeg
+* Speech/lyrics extraction: faster-whisper
+* Song categorization: Gemini API (structured JSON output)
+* Excel generation/import/export: openpyxl
+* Local filesystem for all downloaded audio and generated data
+
+### Configuration
+
+All paths and settings live in one `.env` file — never scattered through the code:
+
+```env
+GEMINI_API_KEY=
+AUDIO_DIRECTORY=./data/audio
+MUSIC_DIRECTORY=./data/music
+TRANSCRIPTS_DIRECTORY=./data/transcripts
+REPORTS_DIRECTORY=./data/reports
+WHISPER_MODEL=small
+WHISPER_COMPUTE_TYPE=int8
+```
+
+* `GEMINI_API_KEY` is provided later. Do not hardcode it. The app must run fully for every non-Gemini feature (import, download, transcription, Excel, organizing) with this blank. Classification shows "Gemini API key not configured" in the UI rather than crashing or blocking anything else.
+* `MUSIC_DIRECTORY` can later point at a mounted drive — keep it configurable, since the whole point of the final language/category structure is being able to copy it straight to a pendrive.
+* `WHISPER_MODEL` / `WHISPER_COMPUTE_TYPE` default to `small` / `int8`, sized for a 4GB-VRAM GPU (Section 9) — overridable without touching code.
+* Add `.env` to `.gitignore`.
+
+### Architecture notes
+
+* **Three independent background loops**, one per stage — download, transcribe, classify — each polling SQLite for its own `PENDING` items, running concurrently with each other. A song can be transcribing while the next one downloads. This is not one big per-song pipeline, and it's what makes independent per-stage progress and independent per-stage retry possible.
+* **Downloads stay sequential within their own loop** — one at a time (Section 5). The concurrency that matters is *across* stages, not within the download stage itself.
+* **One bad item never stops a stage's loop.** Wrap each item's processing in its own try/except; on failure, mark that item `FAILED` with the real error message and move on to the next `PENDING` item. A crash on song 3 must not stop songs 4 and 5.
+* **Every stage gets its own status + retry**: `download_status`, `transcription_status`, `classification_status`, each `PENDING / PROCESSING / COMPLETED / FAILED` (classification also has `SKIPPED_NO_API_KEY`), each independently retryable without reprocessing the other stages.
+* Progress reporting: the frontend polls a status endpoint every few seconds. No WebSockets/SSE needed at this scale.
+
+---
+
+# 1. WhatsApp chat import
+
+The user will export a WhatsApp chat (1:1 or group — both must work) and upload the ZIP file.
+
+The application should locate and process the `.txt` chat file inside the ZIP.
+
+Ignore other files such as `.vcf` and media files for this MVP.
+
+## Message boundaries (multi-line messages)
+
+A single WhatsApp message can span multiple lines. A new message starts **only** when a line begins with a recognizable `[date, time]` or `date, time -` timestamp pattern. Any line that doesn't start a new timestamp is a continuation of the previous message — append it (preserving internal line breaks) to the current message. Do not treat every newline as a new message; this is the most common WhatsApp-parser bug.
+
+## System / service messages
+
+Lines with no sender — group membership changes, encryption notices, "This message was deleted," "Missing message due to end-to-end encryption" — don't match the normal `Name: message` shape. Detect and skip them explicitly. Never let one crash the parser or get misread as a sender name.
+
+The parser must support normal WhatsApp exported-chat formatting and be reasonably robust to different date/time formats (12h/24h, different separators/locales).
+
+## VERY IMPORTANT: URL extraction
+
+URLs can appear ANYWHERE inside a message. Do NOT assume the entire message is a URL.
+
+All of these must work:
+
+```text
+https://youtube.com/watch?v=ABC
+Check this https://youtube.com/watch?v=ABC
+Check this https://youtube.com/watch?v=ABC very good song
+message http://example.com message
+some text https://youtu.be/ABC more text https://youtube.com/watch?v=XYZ end
+```
+
+For example:
+
+```text
+Babar: message http://example.com message
+```
+
+must produce:
+
+```text
+sender = Babar
+url = http://example.com
+```
+
+Do NOT use simplistic logic such as `if message.startswith("http")` or `if message == url`. Use a proper URL parser/regex and validate the extracted URL.
+
+Multiple URLs inside one message must also be supported:
+
+```text
+Babar: song 1 https://youtu.be/AAA and song 2 https://youtu.be/BBB
+```
+
+must create two link records while retaining the same sender/message context.
+
+Handle punctuation around URLs — `(https://...)`, `[https://...]`, `https://...,`, `https://...!`, trailing `.` — without including it in the stored URL.
+
+The parser should preserve the original message separately from the extracted URL.
+
+### YouTube URL formats to normalize
+
+All of the following must resolve to the same 11-character video ID for extraction and duplicate detection:
+
+```text
+youtube.com/watch?v=ID
+youtube.com/watch?v=ID&list=...&t=42s
+m.youtube.com/watch?v=ID
+music.youtube.com/watch?v=ID
+youtu.be/ID
+youtu.be/ID?si=...
+youtube.com/shorts/ID
+youtube.com/embed/ID
+```
+
+Strip tracking/query params (`si`, `list`, `t`, `feature`, etc.) when normalizing — but keep the original, unmodified URL in its own column.
+
+---
+
+# 2. Extracted link database
+
+For every extracted URL, store:
+
+* ID
+* message date/time
+* sender name
+* original message
+* extracted URL
+* normalized URL
+* YouTube video ID if applicable
+* status — `PENDING`, `DOWNLOADED`, `FAILED`, `SKIPPED_NON_YOUTUBE`
+* error
+* created time
+
+Use SQLite. The database is the source of truth. Excel is only an import/export/report format.
+
+---
+
+# 3. Duplicate handling
+
+The same YouTube video may be sent multiple times.
+
+For YouTube URLs, identify duplicates using the YouTube video ID (normalized per Section 1) rather than comparing raw URLs:
+
+```text
+https://youtube.com/watch?v=ABC
+https://youtu.be/ABC
+```
+
+should be recognized as the same video. Do not download the same video multiple times — but preserve every sender/message record so it's clear who originally shared it.
+
+---
+
+# 4. Excel export
+
+Generate an Excel report containing extracted links.
+
+Columns:
+
+```text
+Date
+Sender
+Message
+URL
+YouTube Video ID
+Status
+```
+
+Make it readable and properly formatted (bold/frozen header row, sensible column widths, date formatting, wrapped text for the message column).
+
+---
+
+# 5. Download system
+
+Use yt-dlp to download AUDIO ONLY. Do not download video. Use FFmpeg for audio extraction/conversion. Download sequentially, one video at a time, within the download loop (see Architecture notes).
+
+### Reliability note
+
+yt-dlp regularly breaks against YouTube's anti-bot changes — "Sign in to confirm you're not a bot" and throttled/garbled streams are ongoing, still-active issues, not something fixed once and done. In practice:
+
+* keep yt-dlp updated (pin a version, expect to bump it when downloads start failing in bulk)
+* be ready to pass browser cookies (`--cookies-from-browser chrome`) if plain requests start getting blocked
+* avoid running through a VPN/datacenter proxy — that's what triggers a lot of these blocks
+* **treat a bot-check failure differently from "video unavailable/private" in the error column** — the first is worth auto-retrying after a cookie refresh or version bump, the second isn't and will just burn retries forever
+
+For every video collect:
+
+```text
+URL
+Sender
+Title
+Channel Name
+Duration
+Video ID
+Audio File Path
+Download Status
+Error
+```
+
+Download progress must be persisted in SQLite. Statuses: `PENDING`, `DOWNLOADING`, `COMPLETED`, `FAILED`.
+
+---
+
+# 6. Resume and retry
+
+REQUIRED. The application must resume from where it stopped.
+
+Example:
+
+```text
+1 COMPLETED
+2 COMPLETED
+3 COMPLETED
+4 FAILED
+5 PENDING
+6 PENDING
+```
+
+If the application closes or crashes, reopening it must NOT start from item 1 — skip completed items and continue from pending/failed ones. A successful download must immediately update SQLite to `COMPLETED`.
+
+Provide: Start / Pause-stop / Retry failed / Resume — and per Architecture notes, this applies independently to each of the three stages, not just downloads.
+
+Do not rely only on Excel or filesystem existence to determine progress.
+
+---
+
+# 7. Safe audio filenames
+
+YouTube titles can contain invalid Windows characters, emojis, very long names, quotes, slashes, colons, and duplicate names.
+
+Create a safe filename before saving. Prevent invalid Windows filenames and path traversal. If two songs have the same safe filename, do not overwrite the existing file.
+
+### Path length
+
+Windows has a default 260-character path limit. Truncate the sanitized title to a safe length and append the YouTube video ID (or a short hash) to the filename — this guarantees both safety and uniqueness in one step, and makes truncation collisions impossible to miss.
+
+---
+
+# 8. Second Excel report
+
+After downloading, generate/update an Excel report containing:
+
+```text
+URL
+Sender
+Audio Title
+Channel Name
+Duration
+Video ID
+Audio Path
+Download Status
+Language
+Category
+Classification Confidence
+```
+
+---
+
+# 9. Whisper / lyrics extraction
+
+After the audio is downloaded, process it with faster-whisper, in its own independent background loop (Architecture notes).
+
+### Model size
+
+On a GTX 1650 (4GB VRAM), use the `small` or `base` model with `int8` compute type as the default (set via `WHISPER_MODEL` / `WHISPER_COMPUTE_TYPE` in Configuration) — `medium` is borderline even quantized, `large` won't fit. Fall back to CPU automatically if CUDA isn't available or runs out of memory. Run the backend natively on Windows, not inside a VM — otherwise faster-whisper won't see the GPU at all.
+
+Extract: detected language, transcript/lyrics.
+
+Store transcripts locally so the same audio never needs re-transcribing:
+
+```text
+data/
+    transcripts/
+        VIDEO_ID.txt
+```
+
+Track `transcription_status` in SQLite (`PENDING / PROCESSING / COMPLETED / FAILED`), independently retryable.
+
+---
+
+# 10. Song classification
+
+Use Gemini for classification (structured JSON output / schema mode — reject anything that doesn't validate) in its own independent background loop. If `GEMINI_API_KEY` is unset, items sit at `classification_status = SKIPPED_NO_API_KEY` and everything else in the app keeps working.
+
+Language and category are separate fields, never combined:
+
+```json
+{ "language": "Punjabi", "category": "Love", "confidence": 0.94 }
+{ "language": "English", "category": "Phonk", "confidence": 0.91 }
+```
+
+The classifier should use: YouTube title, channel name, description/tags if available, Whisper transcript, detected Whisper language.
+
+Initial categories: `Love, Sad, Phonk, Rap, Devotional, Party, Chill, Other`.
+
+Language and category stay independent — `Punjabi + Love`, `Punjabi + Sad`, `English + Phonk`, `Hindi + Love` are all valid. Never create combined labels like `Punjabi Love`.
+
+Results are stored as `ai_language` / `ai_category` / `ai_confidence` — see Section 12 for how user overrides interact with them.
+
+*(Keep the classifier function isolated behind a single interface — Gemini-only for this MVP, but swappable to a local or Groq model later without touching the rest of the pipeline.)*
+
+---
+
+# 11. Classification safeguards
+
+Gemini must return structured JSON matching the schema. Validate before saving. If Gemini returns invalid JSON, retry (capped retry count) or mark `classification_status = FAILED` with the raw error — never silently accept malformed output.
+
+If the transcript is empty or the song is instrumental, fall back to YouTube metadata and mark confidence accordingly — don't claim high confidence with insufficient information.
+
+---
+
+# 12. Local music organization
+
+### AI classification vs. user override
+
+The database keeps AI and user classification separate — one never overwrites the other:
+
+* `ai_language`, `ai_category`, `ai_confidence` — written by the Gemini classifier, never edited by the user
+* `user_language`, `user_category` — null until the user manually sets/changes them in the Organizer UI
+* `final_language`, `final_category` — resolved as `user_* if set, else ai_*`
+
+The Organizer moves files according to `final_language` / `final_category`. This is what implements "the user's manual choice always wins over the AI's guess."
+
+Worked example:
+
+```text
+Gemini says:       song.mp3 → Punjabi / Love
+User changes to:   Punjabi / Sad
+Preview shows:     Music/Punjabi/Sad/song.mp3
+[Apply] → the file is moved only now, not before
+```
+
+`final_language` / `final_category` update the instant the user picks something in the UI; Apply just executes the move for whatever `final_*` currently holds.
+
+### Where audio lands before classification
+
+Downloaded audio can go into a flat `data/audio/` folder, or a per-sender folder (`data/audio/{sender}/`) if you want that as a visual/manual-browsing convenience — optional, since sender is already tracked in SQLite regardless, and the destination structure after classification is language/category, not sender. Track the current path in SQLite either way.
+
+### Final structure
+
+```text
+Music/
+    Punjabi/
+        Love/
+            song.mp3
+        Sad/
+            song2.mp3
+    Hindi/
+        Love/
+            song3.mp3
+    English/
+        Phonk/
+            song4.mp3
+```
+
+The organizer must support a preview before moving files. Do not delete the original file until the move has succeeded. Track the final file path in SQLite.
+
+---
+
+# 13. React UI
+
+### Dashboard
+Live per-stage counts, not just totals:
+
+```text
+Total links: 150
+Downloading: 12 / 150      Downloaded: 130   Failed: 8
+Transcribing: 3 / 138      Transcribed: 128  Failed: 7
+Classifying: 7 / 135       Classified: 120   Failed: 8   Skipped (no key): 0
+```
+
+### WhatsApp Import
+Upload ZIP. Show `Messages found | URLs found | Unique YouTube videos | Senders found`. Allow importing into the database.
+
+### Links
+Table: `Sender | Message | URL | Status`
+
+### Downloads
+Table: `Title | Sender | Channel | Duration | Status | Progress`. Buttons: `Start | Pause | Resume | Retry Failed`.
+
+### Library
+Table: `Title | Sender | Language | Category | Duration | Path`
+
+### Organizer
+Show the proposed folder structure, let the user set/override `user_language` / `user_category` per track, preview the resulting path, then Apply.
+
+---
+
+# 14. Local project structure
+
+```text
+project/
+    frontend/
+        React + TypeScript + Vite
+
+    backend/
+        main.py
+        config.py
+        database.py
+        whatsapp_parser.py
+        url_extractor.py
+        downloader.py
+        whisper_service.py
+        classifier.py
+        excel_service.py
+        organizer.py
+
+    data/
+        app.db
+        imports/
+        audio/
+        transcripts/
+        reports/
+        music/
+
+    .env
+```
+
+---
+
+# 15. Important MVP rules
+
+Keep this project simple. It's a local application for personal/internal use. Do not over-engineer it.
+
+The most important requirements are:
+
+1. Correct WhatsApp parsing (multi-line messages, system-message skipping).
+2. VERY reliable URL extraction from anywhere inside messages.
+3. Multiple URLs per message.
+4. Correct YouTube duplicate detection across all URL formats.
+5. Audio-only yt-dlp downloading, bot-detection failures handled distinctly from permanent failures.
+6. Persistent, independent resume/retry per stage.
+7. Safe filenames within Windows path limits.
+8. Whisper transcription, sized to your GPU, running independently of downloads.
+9. Gemini structured song classification, optional at build time.
+10. Excel reports.
+11. Local file organization with user-override precedence.
+
+Build incrementally, phase by phase (see the phase list near the top). Within Phase 1 specifically, do not proceed past:
+
+```text
+WhatsApp TXT
+    ↓
+message parser (multi-line aware)
+    ↓
+URL extraction
+    ↓
+SQLite
+    ↓
+Excel
+```
+
+until URL extraction correctly handles URLs at the beginning, middle, and end of messages, URLs surrounded by punctuation, and multiple URLs in one message.
+
+
+
+
+-----------------------------------------------------------------------
+Design.md
+-----------------------------------------------------------------------
+## 1. Visual Theme & Atmosphere
+
+Netflix's design is one of the most iconic streaming interfaces in the world. The signature red on black is instantly recognisable. The UI is designed to disappear behind content — dark surfaces keep the focus on thumbnails and playback. Netflix Sans maximises screen real estate on TVs, phones, and browsers.
+
+**Key Characteristics:**
+- Netflix red on true black — cinematic and bold
+- Content is the UI — thumbnails, trailers, artwork
+- UI must recede: no competing visual elements
+- Netflix Sans custom typeface for streaming interface readability
+
+## 2. Color Palette & Roles
+
+### Primary
+- **Netflix Red** (`#E50914`): Logo, primary CTA (Play, Sign Up)
+- **Red Dark** (`#831010`): Hover states, pressed buttons
+
+### Accent Colors
+- **Red Muted** (`#B20710`): Secondary red moments, continue watching bar
+
+### Neutral Scale
+- **Text Primary** (`#FFFFFF`): All titles, body text
+- **Text Secondary** (`#BCBCBC`): Metadata, episode descriptions
+- **Text Muted** (`#808080`): UI labels, inactive nav
+
+### Surface & Borders
+- **Background** (`#141414`): App background
+- **Surface** (`#1F1F1F`): Cards on hover, tooltips
+- **Surface Elevated** (`#2D2D2D`): Expanded cards, modals
+- **Gradient** (`linear-gradient(to top, #141414, transparent)`): Content fade
+
+### Semantic / Status
+- **Match Score** (`#46D369`): % match indicator
+- **New** (`#54B9C5`): New content badge
+- **Top 10** (`#E50914`): Top 10 badge (uses brand red)
+
+## 3. Typography Rules
+
+### Font Family
+Primary: Netflix Sans, fallback: Arial, Helvetica, sans-serif
+
+### Hierarchy
+| Role | Font | Size | Weight | Line Height | Letter Spacing | Notes |
+|------|------|------|--------|-------------|----------------|-------|
+| Hero | Netflix Sans | 52px | 700 | 1.1 | -0.01em | Title card overlays |
+| H1 | Netflix Sans | 36px | 700 | 1.2 | 0 | Section headings |
+| H2 | Netflix Sans | 24px | 600 | 1.3 | 0 | Row titles |
+| H3 | Netflix Sans | 18px | 600 | 1.4 | 0 | Card titles on hover |
+| Body | Netflix Sans | 16px | 400 | 1.5 | 0 | Episode descriptions |
+| UI | Netflix Sans | 14px | 500 | 1.3 | 0.02em | Buttons, nav, labels |
+| Small | Netflix Sans | 12px | 400 | 1.4 | 0 | Duration, ratings |
+
+### Principles
+- Netflix Sans is optimised for TV displays — wider letterforms at small sizes
+- Never use thin or light weights on dark backgrounds
+
+## 4. Component Stylings
+
+### Buttons
+- **Play**: bg `#FFFFFF`, text `#141414`, padding `12px 24px`, radius `4px`, font 16px/700, play icon left
+- **More Info**: bg `rgba(109,109,110,0.7)`, text `#FFFFFF`, same padding/radius
+- **CTA (marketing)**: bg `#E50914`, text `#FFFFFF`, padding `16px 32px`, radius `4px`
+
+### Cards & Containers
+- Default: no border, no bg — just thumbnail image
+- Hover: scale `1.05`, z-index elevated, info panel expands below
+- Expanded card: bg `#1F1F1F`, radius `6px`, shadow `0 8px 24px rgba(0,0,0,0.7)`
+
+### Inputs & Forms
+- Email input: bg `#333333`, border `1px solid #8C8C8C`, radius `4px`, font 16px
+- Focus: border `#FFFFFF`
+
+### Navigation
+- Top nav `linear-gradient(#141414, transparent)` fades to transparent
+- On scroll: solid `#141414`
+- Logo left, nav links right, profile/search icons far right
+
+## 5. Layout Principles
+
+### Spacing System
+- **8px** — Card hover gap
+- **16px** — Row padding
+- **20px** — Card info padding
+- **24px** — Row-to-row gaps
+- **32px** — Section breaks
+- **48px** — Hero/banner spacing
+- **64px** — Major sections
+
+### Grid & Container
+- Content rows: horizontal scroll, 3–6 cards visible depending on screen.
+- Each row is an independent horizontal strip with a category title.
+
+### Whitespace Philosophy
+No whitespace — the grid should be dense with content. Dark fills the gaps.
+
+### Border Radius Scale
+- **None** (0px): Hero full-bleed images
+- **Sm** (4px): Buttons, progress bars, UI badges
+- **Md** (6px): Expanded card containers
+- **Full** (9999px): Avatar, profile circle
+
+## 6. Depth & Elevation
+
+| Level | Treatment | Use |
+|-------|-----------|-----|
+| Flat | `none` | Default thumbnail grid |
+| Hover card | `0 6px 24px rgba(0,0,0,0.7)` | Expanded card on hover |
+| Modal | `0 12px 48px rgba(0,0,0,0.8)` | Detail modal |
+
+## 7. Do's and Don'ts
+
+### Do
+- Use dark backgrounds throughout — the UI disappears behind content
+- Reserve red for Netflix brand elements and sign-up CTAs only
+- Scale cards on hover with a smooth transform — it's a core interaction
+
+### Don't
+- Don't use white backgrounds anywhere in the streaming interface
+- Don't reduce thumbnail size — artwork is the product
+- Don't show text over thumbnails without a gradient overlay
+
+## 8. Responsive Behavior
+
+### Breakpoints
+| Name | Width | Key Changes |
+|------|-------|-------------|
+| Mobile | 0–499px | 2 cards per row, stacked nav |
+| Tablet | 500–1099px | 3–4 cards per row |
+| Desktop | 1100px+ | 5–6 cards per row |
+| TV | 1800px+ | 6–8 cards per row |
+
+### Touch Targets
+Minimum 44×44px. Play button on mobile is full card-width.
+
+### Collapsing Strategy
+Card hover interactions become tap-to-expand on mobile. Row scroll becomes swipe.
+
+## 9. Agent Prompt Guide
+
+### Quick Color Reference
+- Brand/CTA: Netflix Red (`#E50914`)
+- Background: True black (`#141414`)
+- Surface: `#1F1F1F`
+- Text: White (`#FFFFFF`)
+- Play button bg: White (`#FFFFFF`), text black
+- Match score: Green (`#46D369`)
+
+### Iteration Guide
+1. Play button is white with black text — it's the primary action color exception
+2. Dark gradient overlays (`linear-gradient(to top, #141414, transparent)`) are core to the aesthetic
+3. Cards have no visual container — they're just the image
+4. Card hover scales to 1.05 and reveals info — implement with CSS transform
+5. Nav background fades from solid on scroll to transparent at top

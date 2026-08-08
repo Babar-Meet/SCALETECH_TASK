@@ -1,0 +1,31 @@
+# Environments
+backend/venv/
+backend/.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Node / React
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.npm/
+*.local
+
+# Application Data (Ignore everything in backend/data)
+backend/data/
+
+# Test Data provided by user
+test data/
+"test data/"
+temp/
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
