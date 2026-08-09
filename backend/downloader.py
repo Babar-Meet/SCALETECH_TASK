@@ -3,8 +3,8 @@ import re
 import time
 import asyncio
 import json
+import subprocess
 from typing import Optional
-import yt_dlp
 from sqlalchemy.orm import Session
 from database import SessionLocal, Link
 from config import config
@@ -27,87 +27,130 @@ class SQLiteLogger:
     def warning(self, msg): pass
     def error(self, msg): pass
 
+YTDLP_EXE = os.path.join(os.path.dirname(__file__), "extenctions", "yt-dlp.exe")
+
+def get_info_with_retry(url, retry_on_403=True):
+    base_args = [
+        YTDLP_EXE,
+        '--dump-json',
+        '--no-warnings',
+        '--no-playlist',
+        '--extractor-args', 'youtube:player_client=web,web_safari,web_embedded,web_music,web_creator,mweb,ios,android,android_vr,tv,tv_simply,tv_embedded'
+    ]
+    
+    headers_args = [
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
+        '--add-header', 'Referer:https://www.youtube.com/',
+        '--add-header', 'Origin:https://www.youtube.com'
+    ]
+    
+    cmd = base_args + headers_args + [url]
+    
+    # Hide window on Windows
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', errors='replace', creationflags=creationflags)
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        if retry_on_403 and '403' in e.stderr:
+            retry_args = base_args + [
+                '--user-agent', 'Mozilla/5.0 (Linux; Android 10; Mobile; rv:109.0) Gecko/20100101 Firefox/119.0',
+                '--add-header', 'Referer:https://www.youtube.com/',
+                '--add-header', 'Origin:https://www.youtube.com',
+                '--force-ipv4',
+                url
+            ]
+            res2 = subprocess.run(retry_args, capture_output=True, text=True, check=True, encoding='utf-8', errors='replace', creationflags=creationflags)
+            return json.loads(res2.stdout)
+        raise Exception(f"Failed to fetch metadata: {e.stderr}")
+
 def download_audio(url: str, output_dir: str):
-    """
-    Uses yt-dlp to download audio from a YouTube URL.
-    Returns (audio_path, title, channel, duration) on success.
-    Raises Exception on failure.
-    """
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': os.path.join(output_dir, '%(title)s_%(id)s.%(ext)s'),
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-        'logger': SQLiteLogger(),
-    }
+    return download_audio_safe(url, "unknown_id", output_dir)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-        if not info_dict:
-            raise Exception("Failed to extract video info")
-            
-        title = info_dict.get('title', 'Unknown Title')
-        channel = info_dict.get('uploader', 'Unknown Channel')
-        duration = info_dict.get('duration', 0)
-        video_id = info_dict.get('id', '')
-        
-        # Calculate the final filename created by postprocessor
-        safe_name = sanitize_filename(title, video_id)
-        # yt-dlp will save as mp3 because of postprocessor
-        # The outtmpl uses the raw title, which yt-dlp handles escaping for.
-        # Let's actually force our safe filename format in yt-dlp outtmpl to be perfectly sure.
-        pass
-        
 def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int = None, loop=None, manager=None):
-    # It's better to extract info first, then download with our explicit filename
-    ydl_opts_info = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get('title', 'Unknown Title')
-        channel = info.get('uploader', 'Unknown Channel')
-        duration = info.get('duration', 0)
-        
-    safe_name = sanitize_filename(title, video_id)
+    info = get_info_with_retry(url)
+    title = info.get('title', 'Unknown Title')
+    channel = info.get('uploader', 'Unknown Channel')
+    duration = info.get('duration', 0)
+    actual_video_id = info.get('id', video_id)
+    
+    safe_name = sanitize_filename(title, actual_video_id)
     outtmpl = os.path.join(output_dir, f"{safe_name}.%(ext)s")
-    
-    def my_hook(d):
-        if d['status'] == 'downloading':
-            percent = d.get('_percent_str', '').strip()
-            if percent and link_id and loop and manager:
-                try:
-                    # _percent_str often looks like " 45.6%" or " \x1b[0;94m 45.6%\x1b[0m"
-                    clean_percent = re.sub(r'\x1b[^m]*m', '', percent)
-                    msg = json.dumps({"type": "progress", "id": link_id, "percent": clean_percent})
-                    asyncio.run_coroutine_threadsafe(manager.broadcast(msg), loop)
-                except Exception:
-                    pass
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': outtmpl,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-        'progress_hooks': [my_hook],
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-        
     final_path = os.path.join(output_dir, f"{safe_name}.mp3")
+    
+    # If the file already exists locally, skip downloading and return immediately
+    if os.path.exists(final_path):
+        return final_path, title, channel, duration
+        
+    base_args = [
+        YTDLP_EXE,
+        '-f', 'bestaudio/best',
+        '-x', '--audio-format', 'mp3', '--audio-quality', '192K',
+        '-o', outtmpl,
+        '--no-playlist',
+        '--extractor-args', 'youtube:player_client=web,web_safari,web_embedded,web_music,web_creator,mweb,ios,android,android_vr,tv,tv_simply,tv_embedded',
+        '--retries', '10',
+        '--fragment-retries', '10',
+        '--socket-timeout', '30',
+        '--newline'
+    ]
+    
+    headers_args = [
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
+        '--add-header', 'Referer:https://www.youtube.com/',
+        '--add-header', 'Origin:https://www.youtube.com'
+    ]
+    
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    
+    def run_cmd(args):
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=creationflags)
+        error_log = []
+        for line in process.stdout:
+            error_log.append(line)
+            if '[download]' in line and '%' in line:
+                match = re.search(r'([\d\.]+)%', line)
+                if match and link_id and loop and manager:
+                    clean_percent = match.group(1) + "%"
+                    msg = json.dumps({"type": "progress", "id": link_id, "percent": clean_percent})
+                    try:
+                        asyncio.run_coroutine_threadsafe(manager.broadcast(msg), loop)
+                    except Exception:
+                        pass
+            elif '[ExtractAudio]' in line:
+                if link_id and loop and manager:
+                    msg = json.dumps({"type": "progress", "id": link_id, "percent": "EXTRACTING AUDIO"})
+                    try:
+                        asyncio.run_coroutine_threadsafe(manager.broadcast(msg), loop)
+                    except Exception:
+                        pass
+            elif '[Merger]' in line or '[Metadata]' in line or '[Thumbnails]' in line:
+                if link_id and loop and manager:
+                    msg = json.dumps({"type": "progress", "id": link_id, "percent": "POST-PROCESSING"})
+                    try:
+                        asyncio.run_coroutine_threadsafe(manager.broadcast(msg), loop)
+                    except Exception:
+                        pass
+        process.wait()
+        return process.returncode, "".join(error_log)
+
+    code, output = run_cmd(base_args + headers_args + [url])
+    
+    if code != 0:
+        if '403' in output:
+            retry_headers = [
+                '--user-agent', 'Mozilla/5.0 (Linux; Android 10; Mobile; rv:109.0) Gecko/20100101 Firefox/119.0',
+                '--add-header', 'Referer:https://www.youtube.com/',
+                '--add-header', 'Origin:https://www.youtube.com',
+                '--force-ipv4'
+            ]
+            code, output = run_cmd(base_args + retry_headers + [url])
+            if code != 0:
+                raise Exception(f"yt-dlp error after 403 retry: {output}")
+        else:
+            raise Exception(f"yt-dlp error: {output}")
+
     if not os.path.exists(final_path):
         raise Exception("Output file not found after download")
         
@@ -167,6 +210,15 @@ async def download_loop():
                 link.error = str(e)
                 
             db.commit()
+            
+            # Auto-update Excel file
+            try:
+                from excel_service import export_links_to_excel
+                all_links = db.query(Link).all()
+                export_links_to_excel(all_links)
+            except Exception as ex:
+                print(f"Auto-export to Excel failed: {ex}")
+                
             from websocket_manager import manager
             await manager.broadcast("update")
         except Exception as e:

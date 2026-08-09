@@ -87,6 +87,15 @@ def update_category(link_id: int, request: CategoryUpdateRequest, db: Session = 
             link.audio_path = new_path
             
     db.commit()
+    
+    # Auto-update Excel file
+    try:
+        from excel_service import export_links_to_excel
+        all_links = db.query(Link).all()
+        export_links_to_excel(all_links)
+    except Exception as ex:
+        print(f"Auto-export to Excel failed: {ex}")
+        
     return {"message": "Category updated", "audio_path": link.audio_path}
 
 @app.post("/api/upload")
@@ -100,7 +109,8 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
         
     import uuid
     unique_id = str(uuid.uuid4())
-    extract_dir = os.path.join(config.IMPORTS_DIRECTORY, f"extracted_{unique_id}")
+    temp_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp")
+    extract_dir = os.path.join(temp_dir, f"extracted_{unique_id}")
     os.makedirs(extract_dir, exist_ok=True)
     
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -124,15 +134,32 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
     duplicate_count = 0
     senders = set()
     
+    seen_in_this_import = set()
+    
     for res in results:
         senders.add(res['sender'])
         # Check duplicates by youtube_video_id if exists
         is_duplicate = False
-        if res['youtube_video_id']:
-            existing = db.query(Link).filter(Link.youtube_video_id == res['youtube_video_id']).first()
-            if existing:
+        vid = res['youtube_video_id']
+        if vid:
+            if vid in seen_in_this_import:
                 is_duplicate = True
+            else:
+                existing = db.query(Link).filter(Link.youtube_video_id == vid).first()
+                if existing:
+                    is_duplicate = True
+                seen_in_this_import.add(vid)
                 
+        # Determine status
+        if not vid:
+            status = "SKIPPED_NON_YOUTUBE"
+        elif res.get('is_private'):
+            status = "SKIPPED_PRIVATE"
+        elif is_duplicate:
+            status = "DUPLICATE"
+        else:
+            status = "PENDING"
+            
         # We save all messages to retain context, but if it's a duplicate video we can mark it
         db_link = Link(
             message_date=res['message_date'],
@@ -140,10 +167,10 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             original_message=res['original_message'],
             extracted_url=res['extracted_url'],
             normalized_url=res['normalized_url'],
-            youtube_video_id=res['youtube_video_id'],
+            youtube_video_id=vid,
             audio_title=res.get('audio_title'),
             channel_name=res.get('channel_name'),
-            status="PENDING" if res['youtube_video_id'] and not is_duplicate else ("SKIPPED_NON_YOUTUBE" if not res['youtube_video_id'] else "DUPLICATE")
+            status=status
         )
         db.add(db_link)
         saved_count += 1
@@ -152,6 +179,14 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             
     db.commit()
     
+    # Auto-update Excel file
+    try:
+        from excel_service import export_links_to_excel
+        all_links = db.query(Link).all()
+        export_links_to_excel(all_links)
+    except Exception as ex:
+        print(f"Auto-export to Excel failed: {ex}")
+        
     return {
         "messages_found": len(results),
         "urls_saved": saved_count,
@@ -159,9 +194,57 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
         "senders_found": len(senders)
     }
 
+def verify_link_states(links: List[Link], db: Session):
+    changed = False
+    for link in links:
+        if link.status == "COMPLETED" and link.audio_path:
+            if not os.path.exists(link.audio_path):
+                link.status = "PENDING"
+                link.audio_path = None
+                changed = True
+    if changed:
+        db.commit()
+
+@app.delete("/api/links/clean/non-youtube")
+def clean_non_youtube(db: Session = Depends(get_db)):
+    links = db.query(Link).filter(Link.status == "SKIPPED_NON_YOUTUBE").all()
+    count = len(links)
+    for link in links:
+        db.delete(link)
+    db.commit()
+    if count > 0:
+        try:
+            from excel_service import export_links_to_excel
+            all_links = db.query(Link).all()
+            export_links_to_excel(all_links)
+        except Exception:
+            pass
+    return {"message": f"Deleted {count} non-YouTube links"}
+
+@app.delete("/api/links/{link_id}")
+def delete_link(link_id: int, db: Session = Depends(get_db)):
+    link = db.query(Link).filter(Link.id == link_id).first()
+    if not link:
+        return {"error": "Link not found"}
+    if link.audio_path and os.path.exists(link.audio_path):
+        try:
+            os.remove(link.audio_path)
+        except Exception as e:
+            print(f"Failed to delete local file: {e}")
+    db.delete(link)
+    db.commit()
+    try:
+        from excel_service import export_links_to_excel
+        all_links = db.query(Link).all()
+        export_links_to_excel(all_links)
+    except Exception:
+        pass
+    return {"message": "Link deleted successfully"}
+
 @app.get("/api/links", response_model=List[LinkResponse])
 def get_links(db: Session = Depends(get_db)):
     links = db.query(Link).order_by(Link.id.desc()).all()
+    verify_link_states(links, db)
     return links
 
 @app.get("/api/downloads", response_model=List[LinkResponse])
@@ -170,6 +253,7 @@ def get_downloads(db: Session = Depends(get_db)):
     links = db.query(Link).filter(
         Link.status.in_(["PENDING", "DOWNLOADING", "COMPLETED", "FAILED"])
     ).order_by(Link.id.desc()).all()
+    verify_link_states(links, db)
     return links
 
 @app.delete("/api/links")
@@ -218,6 +302,9 @@ def retry_download(link_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_db)):
+    completed_links = db.query(Link).filter(Link.status == "COMPLETED").all()
+    verify_link_states(completed_links, db)
+    
     total = db.query(Link).count()
     pending = db.query(Link).filter(Link.status == "PENDING").count()
     downloaded = db.query(Link).filter(Link.status == "COMPLETED").count()

@@ -5,6 +5,6 @@ openpyxl
 pydantic
 python-multipart
 sqlalchemy
-yt-dlp
+yt-dlp==2026.06.09
 python-dateutil
 websockets

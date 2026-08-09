@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
-import { Music, Upload, Link as LinkIcon, DownloadCloud } from 'lucide-react';
+import { Music } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import ImportPage from './pages/ImportPage';
 import LinksPage from './pages/LinksPage';
@@ -21,7 +21,7 @@ function App() {
       <nav className={`navbar ${scrolled ? 'scrolled' : ''}`}>
         <div className="nav-brand">
           <Music size={28} />
-          <span>N-Music</span>
+          <span>WhatsApp Song Downloader</span>
         </div>
         <div className="nav-links">
           <NavLink to="/" className={({isActive}) => `nav-link ${isActive ? 'active' : ''}`}>

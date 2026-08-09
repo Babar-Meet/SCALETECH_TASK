@@ -71,6 +71,8 @@ import urllib.request
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from downloader import get_info_with_retry
+
 def fetch_youtube_metadata(url, video_id):
     metadata = {
         'audio_title': None,
@@ -80,14 +82,28 @@ def fetch_youtube_metadata(url, video_id):
         return metadata
         
     try:
+        # Fast oembed fetch first
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
         req = urllib.request.Request(oembed_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=3) as response:
             data = json.loads(response.read().decode())
             metadata['audio_title'] = data.get('title')
             metadata['channel_name'] = data.get('author_name')
+            return metadata
     except Exception as e:
-        print(f"Failed to fetch metadata for {video_id}: {e}")
+        print(f"Oembed failed for {video_id}, falling back to yt-dlp: {e}")
+        try:
+            # Fallback to robust yt-dlp based metadata fetcher
+            info = get_info_with_retry(url, retry_on_403=True)
+            metadata['audio_title'] = info.get('title')
+            metadata['channel_name'] = info.get('uploader', info.get('uploader_id', info.get('channel')))
+        except Exception as e2:
+            err_msg = str(e2)
+            if "Private video" in err_msg or "Sign in if you've been granted access" in err_msg:
+                metadata['is_private'] = True
+                print(f"Skipping private video: {video_id}")
+            else:
+                print(f"Failed to fetch metadata for {video_id}: {e2}")
     return metadata
 
 def process_chat_file(filepath: str):
@@ -130,11 +146,13 @@ def process_chat_file(filepath: str):
             item = future_to_item[future]
             try:
                 meta = future.result()
-                item['audio_title'] = meta['audio_title']
-                item['channel_name'] = meta['channel_name']
+                item['audio_title'] = meta.get('audio_title')
+                item['channel_name'] = meta.get('channel_name')
+                item['is_private'] = meta.get('is_private', False)
             except Exception:
                 item['audio_title'] = None
                 item['channel_name'] = None
+                item['is_private'] = False
             results.append(item)
             
     # Sort results back by date to keep it somewhat chronological

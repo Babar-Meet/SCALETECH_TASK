@@ -12,6 +12,7 @@ interface DownloadData {
   channel_name: string | null;
   duration: number | null;
   error: string | null;
+  audio_path: string | null;
 }
 
 export default function DownloadsPage() {
@@ -153,7 +154,9 @@ export default function DownloadsPage() {
                 <div className="card-info">
                   <div className="card-meta" style={{justifyContent: 'space-between', marginBottom: '4px'}}>
                     <span className={`badge ${dl.status.toLowerCase()}`}>
-                      {dl.status === 'DOWNLOADING' && progressMap[dl.id] ? `DOWNLOADING (${progressMap[dl.id]})` : dl.status}
+                      {dl.status === 'DOWNLOADING' && progressMap[dl.id] 
+                        ? (progressMap[dl.id].includes('%') ? `DOWNLOADING (${progressMap[dl.id]})` : progressMap[dl.id])
+                        : dl.status}
                     </span>
                     <span>{dl.duration ? `${dl.duration}s` : ''}</span>
                   </div>
@@ -168,16 +171,26 @@ export default function DownloadsPage() {
                     </div>
                   )}
                   
-                  <div style={{marginTop: 'auto', paddingTop: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-                    <a href={dl.extracted_url} target="_blank" rel="noreferrer" style={{color: 'var(--text-secondary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px'}}>
-                      <ExternalLink size={12} /> Watch Original
-                    </a>
+                  <div style={{marginTop: 'auto', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px'}}>
+                    {dl.status === 'COMPLETED' && dl.audio_path && (
+                      <div style={{fontSize: '11px', color: 'var(--text-muted)', wordBreak: 'break-all', background: 'rgba(255,255,255,0.05)', padding: '6px 8px', borderRadius: '4px', borderLeft: '2px solid var(--match-score)'}}>
+                        <strong style={{color: '#fff'}}>Location:</strong><br/>
+                        {dl.audio_path}
+                      </div>
+                    )}
+                    
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                      <a href={dl.extracted_url} target="_blank" rel="noreferrer" style={{color: 'var(--text-secondary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px'}}>
+                        <ExternalLink size={12} /> Source
+                      </a>
+
 
                     {dl.status === 'FAILED' && (
                       <button className="btn" style={{padding: '6px 12px', fontSize: '12px'}} onClick={() => retryDownload(dl.id)}>
                         <RefreshCw size={12} /> Retry
                       </button>
                     )}
+                    </div>
                   </div>
                 </div>
               </div>

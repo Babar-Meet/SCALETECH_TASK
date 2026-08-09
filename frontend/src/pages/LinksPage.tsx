@@ -109,6 +109,26 @@ export default function LinksPage() {
     }
   };
 
+  const cleanNonYT = async () => {
+    if (!window.confirm('Delete all non-YouTube links from the database?')) return;
+    try {
+      await axios.delete('http://localhost:8000/api/links/clean/non-youtube');
+      fetchLinks();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const deleteLink = async (id: number) => {
+    if (!window.confirm('Delete this link?')) return;
+    try {
+      await axios.delete(`http://localhost:8000/api/links/${id}`);
+      fetchLinks();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   return (
     <div>
       <div className="row-header">
@@ -129,6 +149,10 @@ export default function LinksPage() {
             style={{ opacity: isRunning ? 0.5 : 1, cursor: isRunning ? 'not-allowed' : 'pointer' }}
           >
             <DownloadCloud size={18} fill="currentColor" /> {isRunning ? 'Processing...' : 'Process'}
+          </button>
+          <button className="btn" onClick={cleanNonYT} style={{color: 'var(--text-secondary)'}}>
+            <Trash2 size={18} />
+            Clean Non-YT
           </button>
           <button className="btn" onClick={clearAll} style={{color: 'var(--netflix-red)'}}>
             <Trash2 size={18} />
@@ -196,10 +220,17 @@ export default function LinksPage() {
                     )}
                   </div>
                   
-                  <div style={{marginTop: 'auto', paddingTop: '8px'}}>
+                  <div style={{marginTop: 'auto', paddingTop: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
                     <a href={link.extracted_url} target="_blank" rel="noreferrer" style={{color: 'var(--text-primary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px'}}>
                       <ExternalLink size={12} /> Watch Original
                     </a>
+                    <button 
+                      onClick={() => deleteLink(link.id)} 
+                      style={{background: 'none', border: 'none', color: 'var(--netflix-red)', cursor: 'pointer', padding: '4px'}}
+                      title="Remove Link"
+                    >
+                      <Trash2 size={18} />
+                    </button>
                   </div>
                 </div>
               </div>
