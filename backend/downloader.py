@@ -3,11 +3,14 @@ import re
 import time
 import asyncio
 import json
+import logging
 import subprocess
 from typing import Optional
 from sqlalchemy.orm import Session
 from database import SessionLocal, Link
 from config import config
+
+logger = logging.getLogger("downloader")
 
 # Global flag to control the background loop
 download_loop_running = False
@@ -69,11 +72,13 @@ def download_audio(url: str, output_dir: str):
     return download_audio_safe(url, "unknown_id", output_dir)
 
 def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int = None, loop=None, manager=None):
+    logger.info(f"[Link {link_id or '?'}] Fetching metadata for {video_id}...")
     info = get_info_with_retry(url)
     title = info.get('title', 'Unknown Title')
     channel = info.get('uploader', 'Unknown Channel')
     duration = info.get('duration', 0)
     actual_video_id = info.get('id', video_id)
+    logger.info(f"[Link {link_id or '?'}] Metadata: \"{title}\" by {channel} ({duration}s)")
     
     safe_name = sanitize_filename(title, actual_video_id)
     outtmpl = os.path.join(output_dir, f"{safe_name}.%(ext)s")
@@ -81,6 +86,7 @@ def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int =
     
     # If the file already exists locally, skip downloading and return immediately
     if os.path.exists(final_path):
+        logger.info(f"[Link {link_id or '?'}] File already exists, skipping download: {os.path.basename(final_path)}")
         return final_path, title, channel, duration
         
     base_args = [
@@ -153,7 +159,8 @@ def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int =
 
     if not os.path.exists(final_path):
         raise Exception("Output file not found after download")
-        
+    
+    logger.info(f"[Link {link_id or '?'}] ✅ Download complete: {os.path.basename(final_path)}")
     return final_path, title, channel, duration
 
 async def download_loop():
@@ -170,6 +177,7 @@ async def download_loop():
                 continue
                 
             # Mark as DOWNLOADING
+            logger.info(f"⬇️ Starting download for Link #{link.id}: {link.normalized_url}")
             link.status = "DOWNLOADING"
             db.commit()
             from websocket_manager import manager
@@ -204,10 +212,16 @@ async def download_loop():
                 link.duration = duration
                 link.status = "COMPLETED"
                 link.error = None
+                logger.info(f"✅ Link #{link.id} downloaded successfully: {os.path.basename(path)}")
+                from websocket_manager import manager
+                await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "QUEUED FOR TRANSCRIBE..."}))
                 
             except Exception as e:
                 link.status = "FAILED"
                 link.error = str(e)
+                logger.error(f"❌ Link #{link.id} download FAILED: {e}")
+                from websocket_manager import manager
+                await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "FAILED"}))
                 
             db.commit()
             
@@ -217,12 +231,12 @@ async def download_loop():
                 all_links = db.query(Link).all()
                 export_links_to_excel(all_links)
             except Exception as ex:
-                print(f"Auto-export to Excel failed: {ex}")
+                logger.error(f"Auto-export to Excel failed: {ex}")
                 
             from websocket_manager import manager
             await manager.broadcast("update")
         except Exception as e:
-            print(f"Error in download loop: {e}")
+            logger.error(f"Error in download loop: {e}")
             await asyncio.sleep(2)
         finally:
             db.close()

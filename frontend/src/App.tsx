@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import ImportPage from './pages/ImportPage';
 import LinksPage from './pages/LinksPage';
 import DownloadsPage from './pages/DownloadsPage';
+import LogPanel from './components/LogPanel';
 
 function App() {
   const [scrolled, setScrolled] = useState(false);
@@ -43,6 +44,8 @@ function App() {
           <Route path="/downloads" element={<DownloadsPage />} />
         </Routes>
       </main>
+      
+      <LogPanel />
     </BrowserRouter>
   );
 }

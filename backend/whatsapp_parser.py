@@ -1,6 +1,9 @@
 import re
+import logging
 from datetime import datetime
 from url_extractor import extract_urls, normalize_youtube_url
+
+logger = logging.getLogger("whatsapp_parser")
 
 # Standard WhatsApp date format regex (supports [date, time] and date, time -)
 # Examples: 
@@ -91,7 +94,7 @@ def fetch_youtube_metadata(url, video_id):
             metadata['channel_name'] = data.get('author_name')
             return metadata
     except Exception as e:
-        print(f"Oembed failed for {video_id}, falling back to yt-dlp: {e}")
+        logger.debug(f"Oembed failed for {video_id}, falling back to yt-dlp: {e}")
         try:
             # Fallback to robust yt-dlp based metadata fetcher
             info = get_info_with_retry(url, retry_on_403=True)
@@ -101,9 +104,9 @@ def fetch_youtube_metadata(url, video_id):
             err_msg = str(e2)
             if "Private video" in err_msg or "Sign in if you've been granted access" in err_msg:
                 metadata['is_private'] = True
-                print(f"Skipping private video: {video_id}")
+                logger.info(f"Skipping private video: {video_id}")
             else:
-                print(f"Failed to fetch metadata for {video_id}: {e2}")
+                logger.warning(f"Failed to fetch metadata for {video_id}: {e2}")
     return metadata
 
 def process_chat_file(filepath: str):

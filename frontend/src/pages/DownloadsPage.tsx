@@ -154,9 +154,25 @@ export default function DownloadsPage() {
                 <div className="card-info">
                   <div className="card-meta" style={{justifyContent: 'space-between', marginBottom: '4px'}}>
                     <span className={`badge ${dl.status.toLowerCase()}`}>
-                      {dl.status === 'DOWNLOADING' && progressMap[dl.id] 
-                        ? (progressMap[dl.id].includes('%') ? `DOWNLOADING (${progressMap[dl.id]})` : progressMap[dl.id])
-                        : dl.status}
+                      {(() => {
+                        // Websocket realtime override
+                        if (progressMap[dl.id]) {
+                          if (progressMap[dl.id].includes('%') && !progressMap[dl.id].includes('TRANSCRIBING')) {
+                            return `DOWNLOADING (${progressMap[dl.id]})`;
+                          }
+                          return progressMap[dl.id];
+                        }
+                        
+                        // DB Fallback logic
+                        if (dl.status === 'COMPLETED') {
+                          if (dl.classification_status === 'COMPLETED') return 'CATEGORIZED';
+                          if (dl.classification_status === 'CLASSIFYING') return 'AI CATEGORIZING...';
+                          if (dl.transcription_status === 'TRANSCRIBING') return 'TRANSCRIBING...';
+                          if (dl.transcription_status === 'COMPLETED' && dl.classification_status === 'PENDING') return 'WAITING AI...';
+                          return 'QUEUED FOR TRANSCRIBE...';
+                        }
+                        return dl.status;
+                      })()}
                     </span>
                     <span>{dl.duration ? `${dl.duration}s` : ''}</span>
                   </div>

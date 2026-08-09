@@ -9,3 +9,5 @@ yt-dlp==2026.06.09
 python-dateutil
 websockets
 faster-whisper
+google-genai
+ 

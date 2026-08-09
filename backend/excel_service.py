@@ -13,7 +13,11 @@ def export_links_to_excel(links):
     ws = wb.active
     ws.title = "WhatsApp Links"
     
-    headers = ["Date", "Sender", "Message", "URL", "YouTube Video ID", "Status"]
+    headers = [
+        "Date", "Sender", "Message", "URL", "Title", "Channel", 
+        "User Category", "AI Category", "AI Confidence", "Language", 
+        "Status", "Local Path"
+    ]
     ws.append(headers)
     
     # Style header
@@ -27,8 +31,14 @@ def export_links_to_excel(links):
             link.sender,
             link.original_message,
             link.extracted_url,
-            link.youtube_video_id if link.youtube_video_id else "",
-            link.status
+            link.audio_title or "",
+            link.channel_name or "",
+            link.category or "",
+            link.ai_category or "",
+            link.ai_confidence or "",
+            link.ai_language or "",
+            link.status,
+            link.audio_path or ""
         ])
         
     # Wrap text for Message column (C)
@@ -39,10 +49,16 @@ def export_links_to_excel(links):
     # Set column widths
     ws.column_dimensions['A'].width = 20
     ws.column_dimensions['B'].width = 20
-    ws.column_dimensions['C'].width = 50
-    ws.column_dimensions['D'].width = 40
-    ws.column_dimensions['E'].width = 20
-    ws.column_dimensions['F'].width = 15
+    ws.column_dimensions['C'].width = 40
+    ws.column_dimensions['D'].width = 30
+    ws.column_dimensions['E'].width = 30
+    ws.column_dimensions['F'].width = 20
+    ws.column_dimensions['G'].width = 15
+    ws.column_dimensions['H'].width = 15
+    ws.column_dimensions['I'].width = 15
+    ws.column_dimensions['J'].width = 15
+    ws.column_dimensions['K'].width = 15
+    ws.column_dimensions['L'].width = 50
     
     # Freeze header
     ws.freeze_panes = "A2"

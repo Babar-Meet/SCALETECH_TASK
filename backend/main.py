@@ -1,5 +1,7 @@
 import os
 import shutil
+import asyncio
+import logging
 from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -14,12 +16,21 @@ from database import SessionLocal, Link
 from whatsapp_parser import process_chat_file
 from excel_service import export_links_to_excel
 from downloader import start_download_loop, stop_download_loop, download_loop_running
+from log_streamer import install_global_logging, ws_log_handler, log_buffer
+
+logger = logging.getLogger("main")
 
 app = FastAPI(title="WhatsApp to YouTube Music Extractor MVP")
 
 @app.on_event("startup")
 async def startup_event():
-    pass # Wait for user to manually trigger downloads from the UI
+    install_global_logging()
+    ws_log_handler.set_loop(asyncio.get_running_loop())
+    logger.info("🚀 Backend server started successfully.")
+    logger.info(f"Audio directory: {os.path.abspath(config.AUDIO_DIRECTORY)}")
+    logger.info(f"Whisper model: {config.WHISPER_MODEL} (compute: {config.WHISPER_COMPUTE_TYPE})")
+    logger.info(f"Gemini API key: {'configured ✓' if config.GEMINI_API_KEY else '✗ NOT SET'}")
+    logger.info(f"Ollama model: {config.OLLAMA_MODEL or 'not configured'}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -59,6 +70,12 @@ class LinkResponse(BaseModel):
     duration: Optional[int] = None
     error: Optional[str] = None
     category: Optional[str] = None
+    transcription_status: Optional[str] = None
+    classification_status: Optional[str] = None
+    ai_language: Optional[str] = None
+    ai_category: Optional[str] = None
+    ai_confidence: Optional[str] = None
+    audio_path: Optional[str] = None
 
 class CategoryUpdateRequest(BaseModel):
     category: str
@@ -100,12 +117,14 @@ def update_category(link_id: int, request: CategoryUpdateRequest, db: Session = 
 
 @app.post("/api/upload")
 async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    logger.info(f"📦 Upload received: {file.filename}")
     if not os.path.exists(config.IMPORTS_DIRECTORY):
         os.makedirs(config.IMPORTS_DIRECTORY, exist_ok=True)
         
     zip_path = os.path.join(config.IMPORTS_DIRECTORY, file.filename)
     with open(zip_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+    logger.info(f"ZIP saved to: {zip_path}")
         
     import uuid
     unique_id = str(uuid.uuid4())
@@ -115,6 +134,7 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
     
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_dir)
+    logger.info(f"ZIP extracted to: {extract_dir}")
         
     txt_file = None
     for root, dirs, files in os.walk(extract_dir):
@@ -126,9 +146,13 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             break
             
     if not txt_file:
+        logger.error("❌ No .txt file found inside the ZIP archive.")
         return {"error": "No .txt file found in ZIP."}
-        
+    
+    logger.info(f"Found chat file: {os.path.basename(txt_file)}")
+    logger.info("Parsing WhatsApp chat and fetching YouTube metadata...")
     results = process_chat_file(txt_file)
+    logger.info(f"Parser returned {len(results)} URL(s) from chat.")
     
     saved_count = 0
     duplicate_count = 0
@@ -178,14 +202,16 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             duplicate_count += 1
             
     db.commit()
+    logger.info(f"✅ Import complete: {saved_count} saved, {duplicate_count} duplicates, {len(senders)} senders.")
     
     # Auto-update Excel file
     try:
         from excel_service import export_links_to_excel
         all_links = db.query(Link).all()
         export_links_to_excel(all_links)
+        logger.info("Excel report auto-updated.")
     except Exception as ex:
-        print(f"Auto-export to Excel failed: {ex}")
+        logger.error(f"Auto-export to Excel failed: {ex}")
         
     return {
         "messages_found": len(results),
@@ -243,7 +269,7 @@ def delete_link(link_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/links", response_model=List[LinkResponse])
 def get_links(db: Session = Depends(get_db)):
-    links = db.query(Link).order_by(Link.id.desc()).all()
+    links = db.query(Link).order_by(Link.id.asc()).all()
     verify_link_states(links, db)
     return links
 
@@ -252,7 +278,7 @@ def get_downloads(db: Session = Depends(get_db)):
     # Return links that are youtube videos and not duplicates
     links = db.query(Link).filter(
         Link.status.in_(["PENDING", "DOWNLOADING", "COMPLETED", "FAILED"])
-    ).order_by(Link.id.desc()).all()
+    ).order_by(Link.id.asc()).all()
     verify_link_states(links, db)
     return links
 
@@ -275,13 +301,27 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.post("/api/downloads/start")
 async def start_downloads():
+    logger.info("▶️ Starting download + AI processor loops...")
     start_download_loop()
+    try:
+        from ai_processor import start_ai_processor_loop
+        start_ai_processor_loop()
+        logger.info("AI processor loop started.")
+    except Exception as e:
+        logger.error(f"Error starting AI loop: {e}")
     await manager.broadcast("update")
     return {"message": "Download loop started"}
 
 @app.post("/api/downloads/pause")
 async def pause_downloads():
+    logger.info("⏸️ Pausing download + AI processor loops...")
     stop_download_loop()
+    try:
+        from ai_processor import stop_ai_processor_loop
+        stop_ai_processor_loop()
+        logger.info("AI processor loop stopped.")
+    except Exception as e:
+        logger.error(f"Error stopping AI loop: {e}")
     await manager.broadcast("update")
     return {"message": "Download loop paused"}
 
@@ -318,6 +358,34 @@ def get_stats(db: Session = Depends(get_db)):
 
 @app.post("/api/export")
 def export_links(db: Session = Depends(get_db)):
+    logger.info("📊 Manual Excel export triggered.")
     links = db.query(Link).all()
     filepath = export_links_to_excel(links)
+    logger.info(f"Excel exported to: {filepath}")
     return {"message": "Export successful", "filepath": filepath}
+
+
+# ---------- Log WebSocket endpoint ----------
+@app.websocket("/api/ws/logs")
+async def log_websocket_endpoint(websocket: WebSocket):
+    """Frontend connects here to receive real-time log stream."""
+    await ws_log_handler.connect(websocket)
+    logger.info("📡 Log viewer connected.")
+    try:
+        while True:
+            await websocket.receive_text()  # keep alive
+    except WebSocketDisconnect:
+        ws_log_handler.disconnect(websocket)
+        logger.info("📡 Log viewer disconnected.")
+
+@app.get("/api/logs")
+def get_logs():
+    """Returns buffered logs for initial page load."""
+    return log_buffer.get_all()
+
+@app.delete("/api/logs")
+def clear_logs():
+    """Clears the in-memory log buffer."""
+    log_buffer.clear()
+    logger.info("🗑️ Log buffer cleared.")
+    return {"message": "Logs cleared"}

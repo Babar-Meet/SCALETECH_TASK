@@ -19,4 +19,13 @@ class ConnectionManager:
             except:
                 pass
 
+    def broadcast_sync(self, message: str, loop=None):
+        import asyncio
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        asyncio.run_coroutine_threadsafe(self.broadcast(message), loop)
+
 manager = ConnectionManager()
