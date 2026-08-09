@@ -19,10 +19,19 @@ frontend/.npm/
 # Application Data (Ignore everything in backend/data)
 backend/data/
 
+# Stray data when anything runs from project root
+data/
+
 # Test Data provided by user
 test data/
 "test data/"
 temp/
+
+# Local test files (not for the job repo)
+TEST_PLAN.md
+Scripts/run_test_backend.bat
+frontend/e2e/
+frontend/playwright.config.ts
 
 # IDEs and OS files
 .vscode/

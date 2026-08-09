@@ -13,6 +13,8 @@ interface DownloadData {
   duration: number | null;
   error: string | null;
   audio_path: string | null;
+  transcription_status: string | null;
+  classification_status: string | null;
 }
 
 export default function DownloadsPage() {
@@ -27,25 +29,41 @@ export default function DownloadsPage() {
     fetchStats();
     fetchStatus();
     
-    const ws = new WebSocket('ws://localhost:8000/api/ws');
-    
-    ws.onmessage = (event) => {
-      if (event.data === 'update') {
-        fetchDownloads();
-        fetchStats();
-        fetchStatus();
-      } else {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'progress') {
-            setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
-          }
-        } catch (e) {}
-      }
+    let ws: WebSocket;
+    let reconnectTimeout: number;
+    const connect = () => {
+      ws = new WebSocket('ws://localhost:8000/api/ws');
+      ws.onmessage = (event) => {
+        if (event.data === 'update') {
+          fetchDownloads();
+          fetchStats();
+          fetchStatus();
+        } else {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'progress') {
+              setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
+            }
+          } catch (e) {}
+        }
+      };
+      ws.onclose = () => {
+        reconnectTimeout = window.setTimeout(connect, 3000);
+      };
     };
+    connect();
+
+    // Safety net: refresh periodically if the websocket drops silently
+    const refreshTimer = window.setInterval(() => {
+      fetchDownloads();
+      fetchStats();
+      fetchStatus();
+    }, 20000);
 
     return () => {
-      ws.close();
+      clearTimeout(reconnectTimeout);
+      clearInterval(refreshTimer);
+      ws?.close();
     };
   }, []);
 
@@ -166,7 +184,9 @@ export default function DownloadsPage() {
                         // DB Fallback logic
                         if (dl.status === 'COMPLETED') {
                           if (dl.classification_status === 'COMPLETED') return 'CATEGORIZED';
+                          if (dl.classification_status === 'FAILED') return 'AI CATEGORIZING FAILED - Retry';
                           if (dl.classification_status === 'CLASSIFYING') return 'AI CATEGORIZING...';
+                          if (dl.transcription_status === 'FAILED') return 'TRANSCRIBING FAILED - Retry';
                           if (dl.transcription_status === 'TRANSCRIBING') return 'TRANSCRIBING...';
                           if (dl.transcription_status === 'COMPLETED' && dl.classification_status === 'PENDING') return 'WAITING AI...';
                           return 'QUEUED FOR TRANSCRIBE...';
@@ -204,6 +224,11 @@ export default function DownloadsPage() {
                     {dl.status === 'FAILED' && (
                       <button className="btn" style={{padding: '6px 12px', fontSize: '12px'}} onClick={() => retryDownload(dl.id)}>
                         <RefreshCw size={12} /> Retry
+                      </button>
+                    )}
+                    {(dl.transcription_status === 'FAILED' || dl.classification_status === 'FAILED') && (
+                      <button className="btn" style={{padding: '6px 12px', fontSize: '12px'}} onClick={() => retryDownload(dl.id)}>
+                        <RefreshCw size={12} /> Retry AI
                       </button>
                     )}
                     </div>

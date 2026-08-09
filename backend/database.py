@@ -49,6 +49,33 @@ class Link(Base):
 
 Base.metadata.create_all(bind=engine)
 
+def ensure_schema_compatibility():
+    """
+    Adds columns introduced after the table was first created so an existing
+    app.db survives upgrades instead of crashing with 'no such column'.
+    """
+    from sqlalchemy import text, inspect
+    inspector = inspect(engine)
+    if "links" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("links")}
+    additions = {
+        "transcription_status": "VARCHAR(50) DEFAULT 'PENDING'",
+        "classification_status": "VARCHAR(50) DEFAULT 'PENDING'",
+        "ai_language": "VARCHAR(100)",
+        "ai_category": "VARCHAR(100)",
+        "ai_confidence": "VARCHAR(50)",
+        "user_language": "VARCHAR(100)",
+        "user_category": "VARCHAR(100)",
+        "final_path": "TEXT",
+    }
+    with engine.begin() as conn:
+        for col, ddl in additions.items():
+            if col not in existing:
+                conn.execute(text(f"ALTER TABLE links ADD COLUMN {col} {ddl}"))
+
+ensure_schema_compatibility()
+
 def get_db():
     db = SessionLocal()
     try:

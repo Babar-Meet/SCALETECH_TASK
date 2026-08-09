@@ -235,6 +235,16 @@ async def ai_processor_loop():
                 Link.audio_path.isnot(None)
             ).first()
             
+            if link and not os.path.exists(link.audio_path):
+                # Audio was deleted/moved externally; re-queue the download
+                from websocket_manager import manager
+                link.status = "PENDING"
+                link.error = "Audio file missing - queued for re-download"
+                logger.warning(f"⚠️ [Link #{link.id}] Audio file missing ({link.audio_path}), re-queueing download.")
+                db.commit()
+                await manager.broadcast("update")
+                continue
+            
             if link and os.path.exists(link.audio_path):
                 logger.info(f"🎤 Starting transcription for Link #{link.id}: \"{link.audio_title or 'unknown'}\"")
                 link.transcription_status = "TRANSCRIBING"

@@ -25,24 +25,39 @@ export default function LinksPage() {
     fetchLinks();
     fetchStatus();
     
-    const ws = new WebSocket('ws://localhost:8000/api/ws');
-    
-    ws.onmessage = (event) => {
-      if (event.data === 'update') {
-        fetchLinks();
-        fetchStatus();
-      } else {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'progress') {
-            setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
-          }
-        } catch (e) {}
-      }
+    let ws: WebSocket;
+    let reconnectTimeout: number;
+    const connect = () => {
+      ws = new WebSocket('ws://localhost:8000/api/ws');
+      ws.onmessage = (event) => {
+        if (event.data === 'update') {
+          fetchLinks();
+          fetchStatus();
+        } else {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'progress') {
+              setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
+            }
+          } catch (e) {}
+        }
+      };
+      ws.onclose = () => {
+        reconnectTimeout = window.setTimeout(connect, 3000);
+      };
     };
+    connect();
+
+    // Safety net: periodic refresh in case the websocket drops silently
+    const refreshTimer = window.setInterval(() => {
+      fetchLinks();
+      fetchStatus();
+    }, 20000);
 
     return () => {
-      ws.close();
+      clearTimeout(reconnectTimeout);
+      clearInterval(refreshTimer);
+      ws?.close();
     };
   }, []);
 

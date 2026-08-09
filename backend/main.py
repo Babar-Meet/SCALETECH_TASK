@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import asyncio
 import logging
@@ -31,10 +32,55 @@ async def startup_event():
     logger.info(f"Whisper model: {config.WHISPER_MODEL} (compute: {config.WHISPER_COMPUTE_TYPE})")
     logger.info(f"Gemini API key: {'configured ✓' if config.GEMINI_API_KEY else '✗ NOT SET'}")
     logger.info(f"Ollama model: {config.OLLAMA_MODEL or 'not configured'}")
+    recover_interrupted_states()
+    start_download_loop()
+    try:
+        from ai_processor import start_ai_processor_loop
+        start_ai_processor_loop()
+        logger.info("AI processor loop started.")
+    except Exception as e:
+        logger.error(f"Error starting AI loop: {e}")
+    logger.info("▶️ Processing loops auto-started (resumes unfinished work).")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     stop_download_loop()
+    try:
+        from ai_processor import stop_ai_processor_loop
+        stop_ai_processor_loop()
+    except Exception:
+        pass
+
+def recover_interrupted_states():
+    """
+    After a crash or manual kill, links can be stuck in mid-flight states
+    (DOWNLOADING / TRANSCRIBING / CLASSIFYING). Reset those back to PENDING
+    so the auto-started loops resume them instead of skipping forever.
+    """
+    db = SessionLocal()
+    try:
+        recovered = {"download": 0, "transcription": 0, "classification": 0}
+        for link in db.query(Link).filter(Link.status == "DOWNLOADING").all():
+            link.status = "PENDING"
+            link.error = "Interrupted - queued for resume"
+            recovered["download"] += 1
+        for link in db.query(Link).filter(Link.transcription_status == "TRANSCRIBING").all():
+            link.transcription_status = "PENDING"
+            recovered["transcription"] += 1
+            transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
+            if os.path.exists(transcript_path):
+                try:
+                    os.remove(transcript_path)
+                except Exception:
+                    pass
+        for link in db.query(Link).filter(Link.classification_status == "CLASSIFYING").all():
+            link.classification_status = "PENDING"
+            recovered["classification"] += 1
+        db.commit()
+        if any(recovered.values()):
+            logger.info(f"♻️ Recovered interrupted states: {recovered}")
+    finally:
+        db.close()
 
 app.add_middleware(
     CORSMiddleware,
@@ -121,19 +167,33 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
     if not os.path.exists(config.IMPORTS_DIRECTORY):
         os.makedirs(config.IMPORTS_DIRECTORY, exist_ok=True)
         
-    zip_path = os.path.join(config.IMPORTS_DIRECTORY, file.filename)
+    # Filenames from WhatsApp exports often contain emoji/non-ASCII chars which
+    # break on Windows. Store under a sanitized name so uploads never 500.
+    raw_name = file.filename or "upload.zip"
+    safe_base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', os.path.basename(raw_name)).strip() or "upload"
+    safe_base = re.sub(r'_+$', '', safe_base)
+    if not safe_base.lower().endswith(".zip"):
+        safe_base += ".zip"
+    import uuid
+    unique_id = str(uuid.uuid4())
+    zip_path = os.path.join(config.IMPORTS_DIRECTORY, f"{unique_id[:8]}_{safe_base}")
     with open(zip_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     logger.info(f"ZIP saved to: {zip_path}")
         
-    import uuid
-    unique_id = str(uuid.uuid4())
     temp_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp")
     extract_dir = os.path.join(temp_dir, f"extracted_{unique_id}")
     os.makedirs(extract_dir, exist_ok=True)
     
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+    except zipfile.BadZipFile as e:
+        logger.error(f"❌ Uploaded file is not a valid ZIP: {e}")
+        return {"error": "Uploaded file is not a valid ZIP archive. Export the chat as .zip from WhatsApp first."}
+    except Exception as e:
+        logger.error(f"❌ Failed to extract ZIP: {e}")
+        return {"error": f"Failed to extract ZIP: {e}"}
     logger.info(f"ZIP extracted to: {extract_dir}")
         
     txt_file = None
@@ -257,6 +317,12 @@ def delete_link(link_id: int, db: Session = Depends(get_db)):
             os.remove(link.audio_path)
         except Exception as e:
             print(f"Failed to delete local file: {e}")
+    transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
+    if os.path.exists(transcript_path):
+        try:
+            os.remove(transcript_path)
+        except Exception:
+            pass
     db.delete(link)
     db.commit()
     try:
@@ -333,12 +399,29 @@ def get_download_status():
 @app.post("/api/downloads/retry/{link_id}")
 def retry_download(link_id: int, db: Session = Depends(get_db)):
     link = db.query(Link).filter(Link.id == link_id).first()
-    if link and link.status == "FAILED":
-        link.status = "PENDING"
-        link.error = None
-        db.commit()
-        return {"message": "Download queued for retry"}
-    return {"error": "Link not found or not in FAILED state"}
+    if not link:
+        return {"error": "Link not found"}
+
+    needs_download_retry = link.status == "FAILED"
+    needs_ai_retry = link.transcription_status == "FAILED" or link.classification_status == "FAILED"
+    if not (needs_download_retry or needs_ai_retry):
+        return {"error": "Link has no failed stage to retry"}
+
+    if link.audio_path:
+        # Archive the stale transcript so a re-run starts clean
+        transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
+        if os.path.exists(transcript_path):
+            try:
+                os.remove(transcript_path)
+            except Exception:
+                pass
+
+    link.error = None
+    link.status = "PENDING" if needs_download_retry else link.status
+    link.transcription_status = "PENDING" if link.transcription_status == "FAILED" else link.transcription_status
+    link.classification_status = "PENDING" if link.classification_status == "FAILED" else link.classification_status
+    db.commit()
+    return {"message": "Queued for retry"}
 
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_db)):
