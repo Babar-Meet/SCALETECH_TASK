@@ -1,0 +1,30 @@
+# Environments
+backend/venv/
+backend/.env
+.env
+.env.bak.live
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Node / React
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.npm/
+*.local
+
+# Application data (runtime-generated, includes downloaded audio/transcripts)
+backend/data/
+data/
+temp/
+backend/*.log
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

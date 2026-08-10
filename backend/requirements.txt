@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-dotenv
+openpyxl
+pydantic
+python-multipart
+sqlalchemy
+yt-dlp==2026.06.09
+python-dateutil
+websockets
+faster-whisper
+google-genai
+ 
