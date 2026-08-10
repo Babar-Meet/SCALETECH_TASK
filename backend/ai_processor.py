@@ -39,7 +39,7 @@ def get_whisper_model() -> WhisperModel:
         logger.info(f"Whisper model loaded on {global_whisper_device} ({global_whisper_compute})")
     except Exception as e:
         if global_whisper_device == "cuda":
-            logger.warning(f"Whisper: CUDA unavailable ({e}). Using CPU permanently. Install CUDA 12 + cuBLAS (cublas64_12.dll) to enable GPU transcription.")
+            logger.warning(f"Whisper: CUDA unavailable ({e}). Using CPU permanently. Run Scripts/setup.bat to install the cuBLAS DLLs (cublas64_12.dll) needed for GPU transcription.")
             global_whisper_device = "cpu"
             global_whisper_compute = "int8"
             _whisper_model = _load_whisper("cpu", "int8")
@@ -73,7 +73,7 @@ def probe_whisper():
                 list(segments)
                 logger.info("Whisper: GPU probe OK — using CUDA.")
             except Exception as e:
-                logger.warning(f"Whisper: GPU runtime unavailable ({e}). Using CPU permanently. Install CUDA 12 + cuBLAS (cublas64_12.dll) to enable GPU transcription.")
+                logger.warning(f"Whisper: GPU runtime unavailable ({e}). Using CPU permanently. Run Scripts/setup.bat to install the cuBLAS DLLs (cublas64_12.dll) needed for GPU transcription.")
                 global_whisper_device = "cpu"
                 global_whisper_compute = "int8"
                 _whisper_model = _load_whisper("cpu", "int8")

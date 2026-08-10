@@ -10,4 +10,5 @@ python-dateutil
 websockets
 faster-whisper
 google-genai
+nvidia-cublas-cu12
  
