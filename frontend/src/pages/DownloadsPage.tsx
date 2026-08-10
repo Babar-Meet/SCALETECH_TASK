@@ -21,7 +21,7 @@ export default function DownloadsPage() {
   const [downloads, setDownloads] = useState<DownloadData[]>([]);
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState<any>(null);
-  const [isRunning, setIsRunning] = useState(false);
+  const [loopStatus, setLoopStatus] = useState<any>(null);
   const [progressMap, setProgressMap] = useState<Record<number, string>>({});
 
   useEffect(() => {
@@ -43,6 +43,8 @@ export default function DownloadsPage() {
             const data = JSON.parse(event.data);
             if (data.type === 'progress') {
               setProgressMap(prev => ({ ...prev, [data.id]: data.percent }));
+            } else if (data.type === 'status') {
+              setLoopStatus(data);
             }
           } catch (e) {}
         }
@@ -70,7 +72,7 @@ export default function DownloadsPage() {
   const fetchStatus = async () => {
     try {
       const res = await axios.get('http://localhost:8000/api/downloads/status');
-      setIsRunning(res.data.is_running);
+      setLoopStatus(res.data);
     } catch (err) {
       console.error(err);
     }
@@ -97,14 +99,16 @@ export default function DownloadsPage() {
   };
 
   const startLoop = async () => {
-    setIsRunning(true);
     await axios.post('http://localhost:8000/api/downloads/start');
+    fetchStatus();
   };
 
   const pauseLoop = async () => {
-    setIsRunning(false);
     await axios.post('http://localhost:8000/api/downloads/pause');
+    fetchStatus();
   };
+
+  const isRunning = loopStatus?.is_running ?? false;
 
   const retryDownload = async (id: number) => {
     await axios.post(`http://localhost:8000/api/downloads/retry/${id}`);
@@ -116,10 +120,27 @@ export default function DownloadsPage() {
       <div className="row-header">
         <div style={{display: 'flex', alignItems: 'center', gap: '16px'}}>
           <h1>Downloads</h1>
-          {isRunning && (
-            <div style={{display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--match-score)', fontSize: '14px', fontWeight: 'bold'}}>
-              <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: 'var(--match-score)', animation: 'pulse 1.5s infinite'}}></div>
-              Processing Active
+          {isRunning ? (
+            loopStatus.phase === 'working' ? (
+              <div style={{display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--match-score)', fontSize: '14px', fontWeight: 'bold'}}>
+                <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: 'var(--match-score)', animation: 'pulse 1.5s infinite'}}></div>
+                Processing Active
+                {loopStatus.idle_seconds != null && (
+                  <span style={{color: 'var(--text-muted)', fontWeight: 'normal', fontSize: '12px'}}>
+                    last activity {Math.max(0, Math.round(loopStatus.idle_seconds))}s ago
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div style={{display: 'flex', alignItems: 'center', gap: '8px', color: '#eab308', fontSize: '14px', fontWeight: 'bold'}}>
+                <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#eab308', animation: 'pulse 1.5s infinite'}}></div>
+                Waiting for work — no links pending
+              </div>
+            )
+          ) : (
+            <div style={{display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)', fontSize: '14px', fontWeight: 'bold'}}>
+              <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: 'var(--text-secondary)'}}></div>
+              Paused
             </div>
           )}
         </div>
@@ -144,10 +165,14 @@ export default function DownloadsPage() {
       </div>
 
       {stats && (
-        <div style={{display: 'flex', gap: '32px', marginBottom: '32px', background: 'var(--bg-surface)', padding: '16px 24px', borderRadius: '4px'}}>
-          <div style={{color: 'var(--text-secondary)'}}>Pending: <strong style={{color: '#eab308', marginLeft: '8px', fontSize: '18px'}}>{stats.pending_download}</strong></div>
-          <div style={{color: 'var(--text-secondary)'}}>Downloaded: <strong style={{color: 'var(--match-score)', marginLeft: '8px', fontSize: '18px'}}>{stats.downloaded}</strong></div>
-          <div style={{color: 'var(--text-secondary)'}}>Failed: <strong style={{color: 'var(--netflix-red)', marginLeft: '8px', fontSize: '18px'}}>{stats.failed_download}</strong></div>
+        <div style={{display: 'flex', gap: '32px', marginBottom: '32px', background: 'var(--bg-surface)', padding: '16px 24px', borderRadius: '4px', flexWrap: 'wrap'}}>
+          <div style={{color: 'var(--text-secondary)'}}>Total: <strong style={{color: 'var(--text-primary)', marginLeft: '8px', fontSize: '18px'}}>{stats.total_links}</strong></div>
+          <div style={{color: 'var(--text-secondary)'}}>Pending: <strong style={{color: '#eab308', marginLeft: '8px', fontSize: '18px'}}>{stats.pending}</strong></div>
+          <div style={{color: 'var(--text-secondary)'}}>Downloading: <strong style={{color: 'var(--badge-new)', marginLeft: '8px', fontSize: '18px'}}>{stats.downloading}</strong></div>
+          <div style={{color: 'var(--text-secondary)'}}>Transcribing: <strong style={{color: 'var(--badge-new)', marginLeft: '8px', fontSize: '18px'}}>{stats.transcribing}</strong></div>
+          <div style={{color: 'var(--text-secondary)'}}>Categorizing: <strong style={{color: '#c084fc', marginLeft: '8px', fontSize: '18px'}}>{stats.categorizing}</strong></div>
+          <div style={{color: 'var(--text-secondary)'}}>Completed: <strong style={{color: 'var(--match-score)', marginLeft: '8px', fontSize: '18px'}}>{stats.completed}</strong></div>
+          <div style={{color: 'var(--text-secondary)'}}>Failed: <strong style={{color: 'var(--netflix-red)', marginLeft: '8px', fontSize: '18px'}}>{stats.failed}</strong></div>
         </div>
       )}
 

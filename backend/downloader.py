@@ -7,8 +7,11 @@ import logging
 import subprocess
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 from database import SessionLocal, Link
 from config import config
+from db_utils import safe_commit
+from loop_state import loop_state
 
 logger = logging.getLogger("downloader")
 
@@ -163,75 +166,148 @@ def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int =
     logger.info(f"[Link {link_id or '?'}] ✅ Download complete: {os.path.basename(final_path)}")
     return final_path, title, channel, duration
 
+def claim_next_download(db: Session) -> Optional[int]:
+    """Atomically claim the next PENDING link (serial worker). Uses a conditional
+    UPDATE so a row deleted by the UI mid-flight simply returns None instead of
+    raising StaleDataError."""
+    try:
+        candidate = db.query(Link.id).filter(Link.status == "PENDING").order_by(Link.id.asc()).limit(1).scalar()
+        if candidate is None:
+            return None
+        result = db.query(Link).filter(Link.id == candidate, Link.status == "PENDING").update(
+            {"status": "DOWNLOADING"}, synchronize_session=False)
+        if result != 1:
+            db.rollback()
+            return None
+        if not safe_commit(db):
+            return None
+        return candidate
+    except SQLAlchemyError as e:
+        logger.warning(f"Claim failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
 async def download_loop():
     global download_loop_running
-    
+
     while download_loop_running:
         db: Session = SessionLocal()
         try:
-            # Find the next PENDING item
-            link = db.query(Link).filter(Link.status == "PENDING").first()
-            if not link:
+            link_id = claim_next_download(db)
+            if link_id is None:
+                # Idle: broadcast a heartbeat periodically so connected UIs
+                # always have a live signal (no unexplained stalls).
+                from websocket_manager import manager
+                if loop_state.heartbeat_due():
+                    db2: Session = SessionLocal()
+                    try:
+                        pending = db2.query(Link).filter(Link.status == "PENDING").count()
+                        active = db2.query(Link).filter(Link.status == "DOWNLOADING").count()
+                    finally:
+                        db2.close()
+                    await manager.broadcast(json.dumps({
+                        "type": "status",
+                        "is_running": True,
+                        "phase": loop_state.phase(True),
+                        "pending": pending,
+                        "active": active,
+                        "idle_seconds": round(loop_state.activity_age(), 1),
+                    }))
                 await asyncio.sleep(2)
                 continue
-                
-            # Mark as DOWNLOADING
-            logger.info(f"⬇️ Starting download for Link #{link.id}: {link.normalized_url}")
-            link.status = "DOWNLOADING"
-            db.commit()
+
+            loop_state.touch()
+
+            # Read the minimal fields needed BEFORE the long await; never touch
+            # this object afterwards (it goes stale the moment we await).
+            info = db.get(Link, link_id)
+            if info is None:
+                continue
+            logger.info(f"⬇️ Starting download for Link #{link_id}: {info.normalized_url}")
+
+            # Instant feedback: the user sees activity the moment work is claimed,
+            # even while yt-dlp is still fetching metadata (no silent stall).
             from websocket_manager import manager
+            loop = asyncio.get_running_loop()
+            await manager.broadcast(json.dumps({"type": "progress", "id": link_id, "percent": "STARTING DOWNLOAD..."}))
+
+            target_dir = config.AUDIO_DIRECTORY
+            if info.category:
+                safe_cat = re.sub(r'[<>:"/\\|?*]', '_', info.category).strip()
+                target_dir = os.path.join(config.AUDIO_DIRECTORY, safe_cat)
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+
+            url = info.normalized_url
+            video_id = info.youtube_video_id
+
             await manager.broadcast("update")
-            
+
             try:
-                # Execute download
-                target_dir = config.AUDIO_DIRECTORY
-                if link.category:
-                    # Sanitize category name for folder
-                    safe_cat = re.sub(r'[<>:"/\\|?*]', '_', link.category).strip()
-                    target_dir = os.path.join(config.AUDIO_DIRECTORY, safe_cat)
-                    
-                if not os.path.exists(target_dir):
-                    os.makedirs(target_dir, exist_ok=True)
-                    
-                from websocket_manager import manager
-                loop = asyncio.get_running_loop()
                 path, title, channel, duration = await asyncio.to_thread(
                     download_audio_safe,
-                    link.normalized_url, 
-                    link.youtube_video_id, 
+                    url,
+                    video_id,
                     target_dir,
-                    link.id,
+                    link_id,
                     loop,
                     manager
                 )
-                
-                link.audio_path = path
-                link.audio_title = title
-                link.channel_name = channel
-                link.duration = duration
-                link.status = "COMPLETED"
-                link.error = None
-                logger.info(f"✅ Link #{link.id} downloaded successfully: {os.path.basename(path)}")
-                from websocket_manager import manager
-                await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "QUEUED FOR TRANSCRIBE..."}))
-                
             except Exception as e:
-                link.status = "FAILED"
-                link.error = str(e)
-                logger.error(f"❌ Link #{link.id} download FAILED: {e}")
-                from websocket_manager import manager
-                await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "FAILED"}))
-                
-            db.commit()
-            
-            # Auto-update Excel file
+                # Re-open a FRESH session to write the failure — the row may have
+                # been deleted while the download was in flight.
+                db2: Session = SessionLocal()
+                try:
+                    row = db2.get(Link, link_id)
+                    if row is None:
+                        logger.info(f"Link #{link_id} deleted while downloading; discarding failure.")
+                        continue
+                    row.status = "FAILED"
+                    row.error = str(e)
+                    safe_commit(db2)
+                    logger.error(f"❌ Link #{link_id} download FAILED: {e}")
+                finally:
+                    db2.close()
+                await manager.broadcast(json.dumps({"type": "progress", "id": link_id, "percent": "FAILED"}))
+            else:
+                db2: Session = SessionLocal()
+                try:
+                    row = db2.get(Link, link_id)
+                    if row is None:
+                        logger.info(f"Link #{link_id} deleted while downloading; removing orphaned file.")
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                        continue
+                    row.audio_path = path
+                    row.audio_title = title
+                    row.channel_name = channel
+                    row.duration = duration
+                    row.status = "COMPLETED"
+                    row.error = None
+                    safe_commit(db2)
+                    logger.info(f"✅ Link #{link_id} downloaded successfully: {os.path.basename(path)}")
+                finally:
+                    db2.close()
+                await manager.broadcast(json.dumps({"type": "progress", "id": link_id, "percent": "QUEUED FOR TRANSCRIBE..."}))
+
+            # Auto-update Excel file (best-effort side effect)
             try:
                 from excel_service import export_links_to_excel
-                all_links = db.query(Link).all()
-                export_links_to_excel(all_links)
+                db3: Session = SessionLocal()
+                try:
+                    all_links = db3.query(Link).all()
+                    export_links_to_excel(all_links)
+                finally:
+                    db3.close()
             except Exception as ex:
                 logger.error(f"Auto-export to Excel failed: {ex}")
-                
+
             from websocket_manager import manager
             await manager.broadcast("update")
         except Exception as e:

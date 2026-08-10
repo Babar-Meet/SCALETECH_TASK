@@ -14,6 +14,11 @@ class Config:
     WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
     WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
     
+    # Import pipeline tuning
+    METADATA_WORKERS = int(os.getenv("METADATA_WORKERS", "10"))
+    IMPORT_CHUNK_SIZE = int(os.getenv("IMPORT_CHUNK_SIZE", "200"))
+    OEMBED_TIMEOUT = int(os.getenv("OEMBED_TIMEOUT", "3"))
+    
     DB_PATH = os.getenv("DB_PATH", "./data/app.db")
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "") # e.g. "gemma:2b" or "llama3"
     OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

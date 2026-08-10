@@ -83,47 +83,13 @@ def parse_whatsapp_chat(filepath: str):
     if current_message:
         yield current_message
 
-import urllib.request
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from downloader import get_info_with_retry
-
-def fetch_youtube_metadata(url, video_id):
-    metadata = {
-        'audio_title': None,
-        'channel_name': None
-    }
-    if not video_id:
-        return metadata
-        
-    try:
-        # Fast oembed fetch first
-        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        req = urllib.request.Request(oembed_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=3) as response:
-            data = json.loads(response.read().decode())
-            metadata['audio_title'] = data.get('title')
-            metadata['channel_name'] = data.get('author_name')
-            return metadata
-    except Exception as e:
-        logger.debug(f"Oembed failed for {video_id}, falling back to yt-dlp: {e}")
-        try:
-            # Fallback to robust yt-dlp based metadata fetcher
-            info = get_info_with_retry(url, retry_on_403=True)
-            metadata['audio_title'] = info.get('title')
-            metadata['channel_name'] = info.get('uploader', info.get('uploader_id', info.get('channel')))
-        except Exception as e2:
-            err_msg = str(e2)
-            if "Private video" in err_msg or "Sign in if you've been granted access" in err_msg:
-                metadata['is_private'] = True
-                logger.info(f"Skipping private video: {video_id}")
-            else:
-                logger.warning(f"Failed to fetch metadata for {video_id}: {e2}")
-    return metadata
-
-def process_chat_file(filepath: str):
-    results = []
+def iter_chat_items(filepath: str):
+    """
+    Parses a WhatsApp chat export (.txt) and yields one dict per extracted URL:
+    {message_date, sender, original_message, extracted_url, normalized_url,
+     youtube_video_id, message_index}. Pure parsing — no network or DB work,
+     so it is fast even for chats with thousands of links.
+    """
     try:
         import dateutil.parser
     except ImportError:
@@ -132,45 +98,24 @@ def process_chat_file(filepath: str):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "python-dateutil"])
         import dateutil.parser
 
-    raw_items = []
+    message_index = 0
     for msg in parse_whatsapp_chat(filepath):
+        message_index += 1
         urls = extract_urls(msg['message'])
         for url in urls:
             normalized, video_id = normalize_youtube_url(url)
             try:
                 date_obj = dateutil.parser.parse(msg['date'], fuzzy=True)
-            except:
+            except Exception:
                 date_obj = datetime.utcnow()
-                
-            raw_items.append({
+
+            yield {
                 'message_date': date_obj,
                 'sender': msg['sender'],
                 'original_message': msg['message'],
                 'extracted_url': url,
                 'normalized_url': normalized,
-                'youtube_video_id': video_id
-            })
-            
-    # Fetch metadata concurrently
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_item = {
-            executor.submit(fetch_youtube_metadata, item['normalized_url'], item['youtube_video_id']): item 
-            for item in raw_items
-        }
-        
-        for future in as_completed(future_to_item):
-            item = future_to_item[future]
-            try:
-                meta = future.result()
-                item['audio_title'] = meta.get('audio_title')
-                item['channel_name'] = meta.get('channel_name')
-                item['is_private'] = meta.get('is_private', False)
-            except Exception:
-                item['audio_title'] = None
-                item['channel_name'] = None
-                item['is_private'] = False
-            results.append(item)
-            
-    # Sort results back by date to keep it somewhat chronological
-    results.sort(key=lambda x: x['message_date'])
-    return results
+                'youtube_video_id': video_id,
+                'message_index': message_index,
+            }
+

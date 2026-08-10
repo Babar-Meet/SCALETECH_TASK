@@ -3,10 +3,12 @@ import re
 import shutil
 import asyncio
 import logging
+import uuid
 from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 import zipfile
 from pydantic import BaseModel
 from typing import List, Optional
@@ -15,10 +17,11 @@ from websocket_manager import manager
 
 from config import config
 from database import SessionLocal, Link
-from whatsapp_parser import process_chat_file
 from excel_service import export_links_to_excel
 from downloader import start_download_loop, stop_download_loop, download_loop_running
 from log_streamer import install_global_logging, ws_log_handler, log_buffer
+from importer import create_import, get_import, cancel_import, run_import_task
+from db_utils import safe_commit
 
 logger = logging.getLogger("main")
 
@@ -34,14 +37,12 @@ async def startup_event():
     logger.info(f"Gemini API key: {'configured ✓' if config.GEMINI_API_KEY else '✗ NOT SET'}")
     logger.info(f"Ollama model: {config.OLLAMA_MODEL or 'not configured'}")
     recover_interrupted_states()
-    start_download_loop()
     try:
-        from ai_processor import start_ai_processor_loop
-        start_ai_processor_loop()
-        logger.info("AI processor loop started.")
+        from ai_processor import probe_whisper
+        await asyncio.to_thread(probe_whisper)
     except Exception as e:
-        logger.error(f"Error starting AI loop: {e}")
-    logger.info("▶️ Processing loops auto-started (resumes unfinished work).")
+        logger.error(f"Whisper probe error: {e}")
+    logger.info("⏸️ Processing loops on standby — user starts downloads via the 'Start Downloading' button.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -101,9 +102,12 @@ def get_db():
 # Pydantic models for responses
 class StatsResponse(BaseModel):
     total_links: int
-    pending_download: int
-    downloaded: int
-    failed_download: int
+    pending: int
+    downloading: int
+    transcribing: int
+    categorizing: int
+    completed: int
+    failed: int
 
 class LinkResponse(BaseModel):
     id: int
@@ -151,7 +155,7 @@ def update_category(link_id: int, request: CategoryUpdateRequest, db: Session = 
             link.audio_path = new_path
             link.final_path = new_path
             
-    db.commit()
+    safe_commit(db)
     
     # Auto-update Excel file
     try:
@@ -164,7 +168,7 @@ def update_category(link_id: int, request: CategoryUpdateRequest, db: Session = 
     return {"message": "Category updated", "audio_path": link.audio_path}
 
 @app.post("/api/upload")
-async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_whatsapp_zip(file: UploadFile = File(...)):
     logger.info(f"📦 Upload received: {file.filename}")
     if not os.path.exists(config.IMPORTS_DIRECTORY):
         os.makedirs(config.IMPORTS_DIRECTORY, exist_ok=True)
@@ -176,113 +180,62 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
     safe_base = re.sub(r'_+$', '', safe_base)
     if not safe_base.lower().endswith(".zip"):
         safe_base += ".zip"
-    import uuid
     unique_id = str(uuid.uuid4())
     zip_path = os.path.join(config.IMPORTS_DIRECTORY, f"{unique_id[:8]}_{safe_base}")
     with open(zip_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     logger.info(f"ZIP saved to: {zip_path}")
-        
-    temp_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp")
-    extract_dir = os.path.join(temp_dir, f"extracted_{unique_id}")
-    os.makedirs(extract_dir, exist_ok=True)
     
+    # Fast validation: peek inside the archive for a .txt entry (no extraction)
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+            has_txt = any(name.endswith('.txt') for name in zip_ref.namelist())
     except zipfile.BadZipFile as e:
         logger.error(f"❌ Uploaded file is not a valid ZIP: {e}")
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
         return JSONResponse(status_code=400, content={"error": "Uploaded file is not a valid ZIP archive. Export the chat as .zip from WhatsApp first."})
     except Exception as e:
-        logger.error(f"❌ Failed to extract ZIP: {e}")
-        return JSONResponse(status_code=400, content={"error": f"Failed to extract ZIP: {e}"})
-    logger.info(f"ZIP extracted to: {extract_dir}")
+        logger.error(f"❌ Failed to read ZIP: {e}")
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+        return JSONResponse(status_code=400, content={"error": f"Failed to read ZIP: {e}"})
         
-    txt_file = None
-    for root, dirs, files in os.walk(extract_dir):
-        for name in files:
-            if name.endswith('.txt'):
-                txt_file = os.path.join(root, name)
-                break
-        if txt_file:
-            break
-            
-    if not txt_file:
+    if not has_txt:
         logger.error("❌ No .txt file found inside the ZIP archive.")
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
         return JSONResponse(status_code=400, content={"error": "No .txt file found in ZIP."})
     
-    logger.info(f"Found chat file: {os.path.basename(txt_file)}")
-    logger.info("Parsing WhatsApp chat and fetching YouTube metadata...")
-    results = process_chat_file(txt_file)
-    logger.info(f"Parser returned {len(results)} URL(s) from chat.")
+    temp_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp")
+    extract_dir = os.path.join(temp_dir, f"extracted_{unique_id}")
     
-    saved_count = 0
-    duplicate_count = 0
-    unique_count = 0
-    senders = set()
+    import_id = create_import(safe_base, zip_path, extract_dir)
+    asyncio.create_task(run_import_task(import_id))
+    logger.info(f"✅ Import {import_id} queued for background processing.")
     
-    seen_in_this_import = set()
-    
-    for res in results:
-        senders.add(res['sender'])
-        # Check duplicates by youtube_video_id if exists
-        is_duplicate = False
-        vid = res['youtube_video_id']
-        if vid:
-            if vid in seen_in_this_import:
-                is_duplicate = True
-            else:
-                existing = db.query(Link).filter(Link.youtube_video_id == vid).first()
-                if existing:
-                    is_duplicate = True
-                seen_in_this_import.add(vid)
-                
-        # Determine status
-        if not vid:
-            status = "SKIPPED_NON_YOUTUBE"
-        elif res.get('is_private'):
-            status = "SKIPPED_PRIVATE"
-        elif is_duplicate:
-            status = "DUPLICATE"
-        else:
-            status = "PENDING"
-            unique_count += 1
-            
-        # We save all messages to retain context, but if it's a duplicate video we can mark it
-        db_link = Link(
-            message_date=res['message_date'],
-            sender=res['sender'],
-            original_message=res['original_message'],
-            extracted_url=res['extracted_url'],
-            normalized_url=res['normalized_url'],
-            youtube_video_id=vid,
-            audio_title=res.get('audio_title'),
-            channel_name=res.get('channel_name'),
-            status=status
-        )
-        db.add(db_link)
-        saved_count += 1
-        if is_duplicate:
-            duplicate_count += 1
-            
-    db.commit()
-    logger.info(f"✅ Import complete: {saved_count} saved, {duplicate_count} duplicates, {len(senders)} senders.")
-    
-    # Auto-update Excel file
-    try:
-        from excel_service import export_links_to_excel
-        all_links = db.query(Link).all()
-        export_links_to_excel(all_links)
-        logger.info("Excel report auto-updated.")
-    except Exception as ex:
-        logger.error(f"Auto-export to Excel failed: {ex}")
-        
-    return {
-        "messages_found": len(results),
-        "urls_saved": saved_count,
-        "unique_youtube_videos": unique_count,
-        "senders_found": len(senders)
-    }
+    return {"import_id": import_id, "filename": safe_base, "phase": "queued"}
+
+@app.get("/api/imports/{import_id}")
+def get_import_status(import_id: str):
+    progress = get_import(import_id)
+    if not progress:
+        return JSONResponse(status_code=404, content={"error": "Import not found"})
+    return progress
+
+@app.delete("/api/imports/{import_id}")
+def cancel_import_endpoint(import_id: str):
+    if not cancel_import(import_id):
+        if not get_import(import_id):
+            return JSONResponse(status_code=404, content={"error": "Import not found"})
+        return JSONResponse(status_code=409, content={"error": "Import already finished"})
+    return {"message": "Import canceled"}
 
 def verify_link_states(links: List[Link], db: Session):
     changed = False
@@ -309,7 +262,7 @@ def verify_link_states(links: List[Link], db: Session):
                         pass
                 changed = True
     if changed:
-        db.commit()
+        safe_commit(db)
 
 @app.delete("/api/links/clean/non-youtube")
 def clean_non_youtube(db: Session = Depends(get_db)):
@@ -317,7 +270,7 @@ def clean_non_youtube(db: Session = Depends(get_db)):
     count = len(links)
     for link in links:
         db.delete(link)
-    db.commit()
+    safe_commit(db)
     if count > 0:
         try:
             from excel_service import export_links_to_excel
@@ -344,7 +297,7 @@ def delete_link(link_id: int, db: Session = Depends(get_db)):
         except Exception:
             pass
     db.delete(link)
-    db.commit()
+    safe_commit(db)
     try:
         from excel_service import export_links_to_excel
         all_links = db.query(Link).all()
@@ -371,7 +324,7 @@ def get_downloads(db: Session = Depends(get_db)):
 @app.delete("/api/links")
 def clear_all_links(db: Session = Depends(get_db)):
     db.query(Link).delete()
-    db.commit()
+    safe_commit(db)
     # Optionally clear the imported directories, but DB clear is minimum.
     return {"message": "All links cleared"}
 
@@ -416,7 +369,26 @@ async def pause_downloads():
 def get_download_status():
     from downloader import download_loop_running
     from ai_processor import processor_loop_running
-    return {"is_running": download_loop_running or processor_loop_running}
+    from loop_state import loop_state
+    is_running = download_loop_running or processor_loop_running
+    db = SessionLocal()
+    try:
+        pending = db.query(Link).filter(Link.status == "PENDING").count()
+        active = (
+            db.query(Link).filter(Link.status == "DOWNLOADING").count()
+            + db.query(Link).filter(Link.status == "COMPLETED", Link.transcription_status == "TRANSCRIBING").count()
+            + db.query(Link).filter(Link.status == "COMPLETED", Link.transcription_status == "COMPLETED",
+                                   Link.classification_status == "CLASSIFYING").count()
+        )
+    finally:
+        db.close()
+    return {
+        "is_running": is_running,
+        "phase": loop_state.phase(is_running),
+        "pending": pending,
+        "active": active,
+        "idle_seconds": round(loop_state.activity_age(), 1),
+    }
 
 @app.post("/api/downloads/retry/{link_id}")
 def retry_download(link_id: int, db: Session = Depends(get_db)):
@@ -442,23 +414,25 @@ def retry_download(link_id: int, db: Session = Depends(get_db)):
     link.status = "PENDING" if needs_download_retry else link.status
     link.transcription_status = "PENDING" if link.transcription_status == "FAILED" else link.transcription_status
     link.classification_status = "PENDING" if link.classification_status == "FAILED" else link.classification_status
-    db.commit()
+    safe_commit(db)
     return {"message": "Queued for retry"}
 
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_db)):
-    completed_links = db.query(Link).filter(Link.status == "COMPLETED").all()
-    verify_link_states(completed_links, db)
-    
-    total = db.query(Link).count()
-    pending = db.query(Link).filter(Link.status == "PENDING").count()
-    downloaded = db.query(Link).filter(Link.status == "COMPLETED").count()
-    failed = db.query(Link).filter(Link.status == "FAILED").count()
+    # "Completed" means the FULL pipeline is done: downloaded + transcribed + AI categorized
     return StatsResponse(
-        total_links=total,
-        pending_download=pending,
-        downloaded=downloaded,
-        failed_download=failed
+        total_links=db.query(Link).count(),
+        pending=db.query(Link).filter(Link.status == "PENDING").count(),
+        downloading=db.query(Link).filter(Link.status == "DOWNLOADING").count(),
+        transcribing=db.query(Link).filter(
+            Link.status == "COMPLETED", Link.transcription_status == "TRANSCRIBING").count(),
+        categorizing=db.query(Link).filter(
+            Link.status == "COMPLETED", Link.transcription_status == "COMPLETED",
+            Link.classification_status == "CLASSIFYING").count(),
+        completed=db.query(Link).filter(
+            Link.status == "COMPLETED", Link.transcription_status == "COMPLETED",
+            Link.classification_status == "COMPLETED").count(),
+        failed=db.query(Link).filter(Link.status == "FAILED").count(),
     )
 
 @app.post("/api/export")

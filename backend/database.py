@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 from config import config
 
@@ -13,6 +13,15 @@ engine = create_engine(
     f"sqlite:///{config.DB_PATH}",
     connect_args={"timeout": 30, "check_same_thread": False},
 )
+
+@event.listens_for(engine, "connect")
+def _sqlite_pragmas(dbapi_conn, _):
+    """WAL mode lets readers run concurrently with the writer, eliminating most
+    SQLITE_BUSY errors; synchronous=NORMAL is the recommended WAL companion."""
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.close()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

@@ -3,76 +3,127 @@ import re
 import asyncio
 import json
 import logging
+import shutil
+import wave
+from typing import Optional
 from faster_whisper import WhisperModel
 from google import genai
 from google.genai import types
 
 from database import SessionLocal, Link
 from config import config
+from db_utils import safe_commit
+from loop_state import loop_state
 
 logger = logging.getLogger("ai_processor")
 
 processor_loop_running = False
 
-# Global state to remember if GPU works or if we should permanently fall back to CPU
+# Global state: model loaded ONCE per process, reused across all links.
+_whisper_model = None
 global_whisper_device = "cuda"
 global_whisper_compute = "float16"
 
-def transcribe_audio(file_path: str, link_id: int = None, loop=None):
-    global global_whisper_device, global_whisper_compute
-    logger.info(f"[Link {link_id or '?'}] Loading Whisper model: {config.WHISPER_MODEL}")
-    
-    device = global_whisper_device
-    compute_type = global_whisper_compute
-    
+
+def _load_whisper(device: str, compute: str) -> WhisperModel:
+    return WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute)
+
+
+def get_whisper_model() -> WhisperModel:
+    """Lazy singleton. Falls back to CPU (int8) permanently if CUDA fails to load."""
+    global _whisper_model, global_whisper_device, global_whisper_compute
+    if _whisper_model is not None:
+        return _whisper_model
     try:
-        # Attempt to load model on current device
-        model = WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute_type)
-        if device == "cuda":
-            logger.info(f"[Link {link_id or '?'}] Whisper: Using GPU")
-        else:
-            logger.info(f"[Link {link_id or '?'}] Whisper: Using CPU")
+        _whisper_model = _load_whisper(global_whisper_device, global_whisper_compute)
+        logger.info(f"Whisper model loaded on {global_whisper_device} ({global_whisper_compute})")
     except Exception as e:
-        if device == "cuda":
-            # Fall back to CPU if GPU is unavailable or fails to init
-            logger.debug(f"GPU initialization failed: {e}")
+        if global_whisper_device == "cuda":
+            logger.warning(f"Whisper: CUDA unavailable ({e}). Using CPU permanently. Install CUDA 12 + cuBLAS (cublas64_12.dll) to enable GPU transcription.")
             global_whisper_device = "cpu"
-            global_whisper_compute = config.WHISPER_COMPUTE_TYPE
-            device = global_whisper_device
-            compute_type = global_whisper_compute
-            model = WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute_type)
-            logger.info(f"[Link {link_id or '?'}] Whisper: Using CPU (GPU unavailable)")
+            global_whisper_compute = "int8"
+            _whisper_model = _load_whisper("cpu", "int8")
+            logger.info("Whisper: Using CPU (int8)")
         else:
-            raise e
-    
+            raise
+    return _whisper_model
+
+
+def _write_probe_wav(path: str):
+    rate = 16000
+    with wave.open(path, "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * (rate // 2))
+
+
+def probe_whisper():
+    """Startup device probe. cublas/cuBLAS DLL errors only surface at first
+    inference, so this runs one tiny real transcription on the loaded model."""
+    global _whisper_model, global_whisper_device, global_whisper_compute
+    probe_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp", "whisper_probe.wav")
+    try:
+        model = get_whisper_model()
+        if global_whisper_device == "cuda":
+            try:
+                os.makedirs(os.path.dirname(probe_path), exist_ok=True)
+                _write_probe_wav(probe_path)
+                segments, info = model.transcribe(probe_path)
+                list(segments)
+                logger.info("Whisper: GPU probe OK — using CUDA.")
+            except Exception as e:
+                logger.warning(f"Whisper: GPU runtime unavailable ({e}). Using CPU permanently. Install CUDA 12 + cuBLAS (cublas64_12.dll) to enable GPU transcription.")
+                global_whisper_device = "cpu"
+                global_whisper_compute = "int8"
+                _whisper_model = _load_whisper("cpu", "int8")
+                logger.info("Whisper: Using CPU (int8)")
+    except Exception as e:
+        logger.warning(f"Whisper probe failed ({e}). Using CPU permanently.")
+        global_whisper_device = "cpu"
+        global_whisper_compute = "int8"
+        try:
+            _whisper_model = _load_whisper("cpu", "int8")
+        except Exception:
+            _whisper_model = None
+    finally:
+        try:
+            if os.path.exists(probe_path):
+                os.remove(probe_path)
+        except Exception:
+            pass
+
+
+def transcribe_audio(file_path: str, link_id: int = None, loop=None):
+    global _whisper_model, global_whisper_device, global_whisper_compute
+    logger.info(f"[Link {link_id or '?'}] Using Whisper model: {config.WHISPER_MODEL}")
+    model = get_whisper_model()
+
     logger.info(f"[Link {link_id or '?'}] 🎤 Transcription started for: {os.path.basename(file_path)}")
-    
+
     try:
         segments, info = model.transcribe(file_path, beam_size=5)
     except Exception as e:
-        if device == "cuda":
-            # Sometimes initialization succeeds but runtime fails (e.g. missing DLLs)
+        if global_whisper_device == "cuda":
+            # DLL errors (e.g. cublas64_12.dll) surface at inference, not load
             logger.warning(f"[Link {link_id or '?'}] GPU runtime error: {e}. Falling back to CPU permanently.")
             global_whisper_device = "cpu"
-            global_whisper_compute = config.WHISPER_COMPUTE_TYPE
-            device = global_whisper_device
-            compute_type = global_whisper_compute
-            model = WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute_type)
-            logger.info(f"[Link {link_id or '?'}] Whisper: Using CPU (GPU unavailable)")
+            global_whisper_compute = "int8"
+            _whisper_model = _load_whisper("cpu", "int8")
+            model = _whisper_model
             segments, info = model.transcribe(file_path, beam_size=5)
         else:
-            raise e
+            raise
     logger.info(f"[Link {link_id or '?'}] Audio duration: {info.duration:.1f}s, detected language: {info.language} (prob: {info.language_probability:.2f})")
-    
+
     transcript_text = ""
     for segment in segments:
         transcript_text += segment.text + " "
         if link_id and loop and info.duration > 0:
             percent = min(100, int((segment.end / info.duration) * 100))
             from websocket_manager import manager
-            import json
             manager.broadcast_sync(json.dumps({"type": "progress", "id": link_id, "percent": f"TRANSCRIBING ({percent}%)"}), loop)
-    
+
     logger.info(f"[Link {link_id or '?'}] ✅ Transcription complete ({len(transcript_text.split())} words)")
     return transcript_text.strip(), info.language, info.language_probability
 
@@ -161,161 +212,242 @@ Output only a valid JSON object in the exact format:
     logger.warning("No AI API configured (Gemini or Ollama). Skipping categorization.")
     return "Skipped (No API Key or Local Model)", "Unknown", "0.0"
 
+def claim_next_classify(db) -> Optional[int]:
+    """Atomically claim the next link ready for AI classification."""
+    try:
+        candidate = db.query(Link.id).filter(
+            Link.transcription_status == "COMPLETED",
+            Link.classification_status == "PENDING"
+        ).order_by(Link.id.asc()).limit(1).scalar()
+        if candidate is None:
+            return None
+        result = db.query(Link).filter(
+            Link.id == candidate,
+            Link.transcription_status == "COMPLETED",
+            Link.classification_status == "PENDING"
+        ).update({"classification_status": "CLASSIFYING"}, synchronize_session=False)
+        if result != 1:
+            db.rollback()
+            return None
+        if not safe_commit(db):
+            return None
+        return candidate
+    except Exception as e:
+        logger.warning(f"Classify claim failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def claim_next_transcribe(db) -> Optional[int]:
+    """Atomically claim the next link ready for transcription."""
+    try:
+        candidate = db.query(Link.id).filter(
+            Link.status == "COMPLETED",
+            Link.transcription_status == "PENDING",
+            Link.audio_path.isnot(None)
+        ).order_by(Link.id.asc()).limit(1).scalar()
+        if candidate is None:
+            return None
+        result = db.query(Link).filter(
+            Link.id == candidate,
+            Link.transcription_status == "PENDING",
+            Link.audio_path.isnot(None)
+        ).update({"transcription_status": "TRANSCRIBING"}, synchronize_session=False)
+        if result != 1:
+            db.rollback()
+            return None
+        if not safe_commit(db):
+            return None
+        return candidate
+    except Exception as e:
+        logger.warning(f"Transcribe claim failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
 async def ai_processor_loop():
     global processor_loop_running
     logger.info("AI Processor loop started.")
-    
+
     while processor_loop_running:
         db = SessionLocal()
         try:
             # 1. Look for items to classify (COMPLETED transcription, PENDING classification)
-            link_to_classify = db.query(Link).filter(
-                Link.transcription_status == "COMPLETED",
-                Link.classification_status == "PENDING"
-            ).first()
-            
-            if link_to_classify:
-                logger.info(f"🧠 Starting AI classification for Link #{link_to_classify.id}: \"{link_to_classify.audio_title or 'unknown'}\"")
-                link_to_classify.classification_status = "CLASSIFYING"
-                db.commit()
-                
+            classify_id = claim_next_classify(db)
+            if classify_id is not None:
+                loop_state.touch()
+                from websocket_manager import manager
+                info = db.get(Link, classify_id)
+                if info is None:
+                    continue
+                audio_title = info.audio_title or "unknown"
+                logger.info(f"🧠 Starting AI classification for Link #{classify_id}: \"{audio_title}\"")
+                await manager.broadcast(json.dumps({"type": "progress", "id": classify_id, "percent": "AI CATEGORIZING..."}))
+
+                transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{classify_id}_transcript.txt")
+                if not os.path.exists(transcript_path):
+                    logger.warning(f"⚠️ [Link #{classify_id}] Transcript file missing, re-queueing transcription.")
+                    db.query(Link).filter(Link.id == classify_id).update(
+                        {"transcription_status": "PENDING", "classification_status": "PENDING"},
+                        synchronize_session=False)
+                    safe_commit(db)
+                    await manager.broadcast("update")
+                    continue
+
                 try:
-                    from websocket_manager import manager
-                    await manager.broadcast(json.dumps({"type": "progress", "id": link_to_classify.id, "percent": "AI CATEGORIZING..."}))
-                    
-                    transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link_to_classify.id}_transcript.txt")
-                    if not os.path.exists(transcript_path):
-                        # The transcript is gone (deleted/moved) even though the row says
-                        # transcription COMPLETED. Re-queue transcription instead of
-                        # classifying an empty text as if it were real content.
-                        logger.warning(f"⚠️ [Link #{link_to_classify.id}] Transcript file missing, re-queueing transcription.")
-                        link_to_classify.transcription_status = "PENDING"
-                        link_to_classify.classification_status = "PENDING"
-                        db.commit()
-                        await manager.broadcast("update")
-                        continue
-                    
                     with open(transcript_path, 'r', encoding='utf-8') as f:
                         text = f.read()
-                        
+
                     category, ai_lang, confidence = await asyncio.to_thread(
-                        categorize_text, text, link_to_classify.audio_title or ""
+                        categorize_text, text, audio_title
                     )
-                    
-                    link_to_classify.ai_category = category
-                    link_to_classify.ai_language = ai_lang
-                    link_to_classify.ai_confidence = confidence
-                    if category and "Skipped" not in category and not link_to_classify.category:
-                        link_to_classify.category = category
-                        
-                    link_to_classify.classification_status = "COMPLETED"
-                    logger.info(f"✅ Link #{link_to_classify.id} classified: {category} / {ai_lang} (conf: {confidence})")
-                    
-                    # Auto-move file to the final Music/{Language}/{Category} layout
-                    if link_to_classify.ai_category and link_to_classify.audio_path and os.path.exists(link_to_classify.audio_path):
-                        import shutil
-                        from organizer import resolve_final_path
 
-                        new_dir = resolve_final_path(link_to_classify)
-                        os.makedirs(new_dir, exist_ok=True)
-
-                        filename = os.path.basename(link_to_classify.audio_path)
-                        new_path = os.path.join(new_dir, filename)
-
-                        if new_path != link_to_classify.audio_path:
-                            shutil.move(link_to_classify.audio_path, new_path)
-                            link_to_classify.audio_path = new_path
-                            link_to_classify.final_path = new_path
-                            logger.info(f"[Link #{link_to_classify.id}] 📁 File moved to: {new_path}")
-
-                    db.commit()
-                    
-                    # Update Excel
+                    # Fresh session — the row may have been deleted during the API call
+                    db2 = SessionLocal()
                     try:
-                        from excel_service import export_links_to_excel
-                        all_links = db.query(Link).all()
-                        export_links_to_excel(all_links)
-                    except Exception as ex:
-                        logger.error(f"Auto-export to Excel failed: {ex}")
+                        row = db2.get(Link, classify_id)
+                        if row is None:
+                            logger.info(f"Link #{classify_id} deleted during classification; discarding.")
+                            continue
+                        row.ai_category = category
+                        row.ai_language = ai_lang
+                        row.ai_confidence = confidence
+                        if category and "Skipped" not in category and not row.category:
+                            row.category = category
+                        row.classification_status = "COMPLETED"
+                        logger.info(f"✅ Link #{classify_id} classified: {category} / {ai_lang} (conf: {confidence})")
 
-                    await manager.broadcast(json.dumps({"type": "progress", "id": link_to_classify.id, "percent": "CATEGORIZED"}))
-                    await manager.broadcast("update")
+                        # Auto-move file to the final Music/{Language}/{Category} layout
+                        if row.ai_category and row.audio_path and os.path.exists(row.audio_path):
+                            from organizer import resolve_final_path
+
+                            new_dir = resolve_final_path(row)
+                            os.makedirs(new_dir, exist_ok=True)
+
+                            filename = os.path.basename(row.audio_path)
+                            new_path = os.path.join(new_dir, filename)
+
+                            if new_path != row.audio_path:
+                                shutil.move(row.audio_path, new_path)
+                                row.audio_path = new_path
+                                row.final_path = new_path
+                                logger.info(f"[Link #{classify_id}] 📁 File moved to: {new_path}")
+
+                        safe_commit(db2)
+                    finally:
+                        db2.close()
                 except Exception as e:
-                    logger.error(f"❌ Classification FAILED for Link #{link_to_classify.id}: {e}")
-                    link_to_classify.classification_status = "FAILED"
-                    link_to_classify.error = str(e)[:500]
-                    db.commit()
-                    await manager.broadcast(json.dumps({"type": "progress", "id": link_to_classify.id, "percent": "AI FAILED"}))
-                    await manager.broadcast("update")
+                    logger.error(f"❌ Classification FAILED for Link #{classify_id}: {e}")
+                    db2 = SessionLocal()
+                    try:
+                        row = db2.get(Link, classify_id)
+                        if row is not None:
+                            row.classification_status = "FAILED"
+                            row.error = str(e)[:500]
+                            safe_commit(db2)
+                    finally:
+                        db2.close()
+                    await manager.broadcast(json.dumps({"type": "progress", "id": classify_id, "percent": "AI FAILED"}))
+
+                # Update Excel (best-effort)
+                try:
+                    from excel_service import export_links_to_excel
+                    db3 = SessionLocal()
+                    try:
+                        export_links_to_excel(db3.query(Link).all())
+                    finally:
+                        db3.close()
+                except Exception as ex:
+                    logger.error(f"Auto-export to Excel failed: {ex}")
+
+                await manager.broadcast(json.dumps({"type": "progress", "id": classify_id, "percent": "CATEGORIZED"}))
+                await manager.broadcast("update")
                 continue
 
             # 2. Look for items to transcribe (COMPLETED download, PENDING transcription)
-            link = db.query(Link).filter(
-                Link.status == "COMPLETED", 
-                Link.transcription_status == "PENDING",
-                Link.audio_path.isnot(None)
-            ).first()
-            
-            if link and not os.path.exists(link.audio_path):
-                # Audio was deleted/moved externally; re-queue the download AND the
-                # downstream stages so a fresh file is re-transcribed and re-classified
-                # instead of silently classifying an empty transcript.
+            transcribe_id = claim_next_transcribe(db)
+            if transcribe_id is not None:
+                loop_state.touch()
                 from websocket_manager import manager
-                link.status = "PENDING"
-                link.error = "Audio file missing - queued for re-download"
-                link.transcription_status = "PENDING"
-                link.classification_status = "PENDING"
-                link.ai_language = None
-                link.ai_category = None
-                link.ai_confidence = None
-                link.final_path = None
-                transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
-                if os.path.exists(transcript_path):
+                info = db.get(Link, transcribe_id)
+                if info is None:
+                    continue
+                audio_path = info.audio_path
+                audio_title = info.audio_title or "unknown"
+
+                if not audio_path or not os.path.exists(audio_path):
+                    # Audio was deleted/moved externally; re-queue the download AND the
+                    # downstream stages (expressed as a conditional UPDATE, no stale objects)
+                    db.query(Link).filter(Link.id == transcribe_id).update(
+                        {"status": "PENDING", "error": "Audio file missing - queued for re-download",
+                         "transcription_status": "PENDING", "classification_status": "PENDING",
+                         "ai_language": None, "ai_category": None, "ai_confidence": None,
+                         "final_path": None},
+                        synchronize_session=False)
+                    transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{transcribe_id}_transcript.txt")
+                    if os.path.exists(transcript_path):
+                        try:
+                            os.remove(transcript_path)
+                        except Exception:
+                            pass
+                    safe_commit(db)
+                    logger.warning(f"⚠️ [Link #{transcribe_id}] Audio file missing ({audio_path}), re-queueing download.")
+                    await manager.broadcast("update")
+                    continue
+
+                logger.info(f"🎤 Starting transcription for Link #{transcribe_id}: \"{audio_title}\"")
+                await manager.broadcast(json.dumps({"type": "progress", "id": transcribe_id, "percent": "TRANSCRIBING..."}))
+
+                try:
+                    text, lang, prob = await asyncio.to_thread(transcribe_audio, audio_path, transcribe_id, asyncio.get_running_loop())
+
+                    db2 = SessionLocal()
                     try:
-                        os.remove(transcript_path)
-                    except Exception:
-                        pass
-                logger.warning(f"⚠️ [Link #{link.id}] Audio file missing ({link.audio_path}), re-queueing download.")
-                db.commit()
+                        row = db2.get(Link, transcribe_id)
+                        if row is None:
+                            logger.info(f"Link #{transcribe_id} deleted during transcription; discarding.")
+                            transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{transcribe_id}_transcript.txt")
+                            if os.path.exists(transcript_path):
+                                try:
+                                    os.remove(transcript_path)
+                                except Exception:
+                                    pass
+                            continue
+                        # Save transcript to file
+                        if not os.path.exists(config.TRANSCRIPTS_DIRECTORY):
+                            os.makedirs(config.TRANSCRIPTS_DIRECTORY, exist_ok=True)
+                        transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{transcribe_id}_transcript.txt")
+                        with open(transcript_path, 'w', encoding='utf-8') as f:
+                            f.write(text)
+                        row.transcription_status = "COMPLETED"
+                        row.ai_language = lang
+                        row.classification_status = "PENDING"  # Now ready for classification
+                        safe_commit(db2)
+                        logger.info(f"✅ Link #{transcribe_id} transcription complete. Queued for classification.")
+                    finally:
+                        db2.close()
+                    await manager.broadcast(json.dumps({"type": "progress", "id": transcribe_id, "percent": "WAITING AI..."}))
+                except Exception as e:
+                    logger.error(f"❌ Transcription FAILED for Link #{transcribe_id}: {e}")
+                    db2 = SessionLocal()
+                    try:
+                        row = db2.get(Link, transcribe_id)
+                        if row is not None:
+                            row.transcription_status = "FAILED"
+                            row.error = str(e)[:500]
+                            safe_commit(db2)
+                    finally:
+                        db2.close()
+                    await manager.broadcast(json.dumps({"type": "progress", "id": transcribe_id, "percent": "TRANSCRIPTION FAILED"}))
                 await manager.broadcast("update")
                 continue
-            
-            if link and os.path.exists(link.audio_path):
-                logger.info(f"🎤 Starting transcription for Link #{link.id}: \"{link.audio_title or 'unknown'}\"")
-                link.transcription_status = "TRANSCRIBING"
-                db.commit()
-                
-                try:
-                    from websocket_manager import manager
-                    await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "TRANSCRIBING..."}))
-                    
-                    text, lang, prob = await asyncio.to_thread(transcribe_audio, link.audio_path, link.id, asyncio.get_running_loop())
-                    
-                    # Save transcript to file
-                    if not os.path.exists(config.TRANSCRIPTS_DIRECTORY):
-                        os.makedirs(config.TRANSCRIPTS_DIRECTORY, exist_ok=True)
-                    
-                    transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
-                    with open(transcript_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                        
-                    link.transcription_status = "COMPLETED"
-                    link.ai_language = lang
-                    link.classification_status = "PENDING" # Now ready for classification
-                    db.commit()
-                    logger.info(f"✅ Link #{link.id} transcription complete. Queued for classification.")
-                    
-                    await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "WAITING AI..."}))
-                    await manager.broadcast("update")
-                except Exception as e:
-                    logger.error(f"❌ Transcription FAILED for Link #{link.id}: {e}")
-                    link.transcription_status = "FAILED"
-                    link.error = str(e)[:500]
-                    db.commit()
-                    await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "TRANSCRIPTION FAILED"}))
-                    await manager.broadcast("update")
-                continue
-                
+
             await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"Error in ai_processor loop: {e}")
