@@ -25,7 +25,11 @@ export default function ImportPage() {
 
     try {
       const res = await axios.post('http://localhost:8000/api/upload', formData);
-      setResults(res.data);
+      if (res.data && res.data.error) {
+        setError(res.data.error);
+      } else {
+        setResults(res.data);
+      }
     } catch (err) {
       if (axios.isAxiosError(err)) {
         setError(err.response?.data?.error || 'Upload failed');

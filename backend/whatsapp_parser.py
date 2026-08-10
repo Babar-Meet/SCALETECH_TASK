@@ -17,6 +17,14 @@ TIMESTAMP_REGEX = re.compile(
 # If a line doesn't match 'Sender: message', it's likely a system message.
 SENDER_REGEX = re.compile(r'^([^:]+):\s*(.*)$', re.DOTALL)
 
+# Some group-chat exports append a trailing colon to system events, e.g.
+# "[..] You added Babar Meet: " or "[..] Raju removed Sita: ". Detect these
+# by keyword even though they match SENDER_REGEX with an empty message body.
+SYSTEM_EVENT_KEYWORDS = re.compile(
+    r'\b(?:added|removed|left|joined|created|deleted|changed|pinned|missed|'
+    r'ended|started|named|encrypted|archived|unarchived)\b',
+    re.IGNORECASE)
+
 def parse_date(date_str: str) -> datetime:
     # A simple fallback, in a real scenario we'd use dateutil.parser or similar for robustness
     # For MVP, we can just return the raw string or try a generic parsing
@@ -52,7 +60,12 @@ def parse_whatsapp_chat(filepath: str):
                 if sender_match:
                     sender = sender_match.group(1)
                     message_text = sender_match.group(2)
-                    
+
+                    if not message_text.strip() and SYSTEM_EVENT_KEYWORDS.search(sender):
+                        # System event with trailing colon (e.g. "You added X: ")
+                        current_message = None
+                        continue
+
                     current_message = {
                         'date': timestamp_str,
                         'sender': sender,

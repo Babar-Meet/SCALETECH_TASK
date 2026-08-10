@@ -5,6 +5,7 @@ import asyncio
 import logging
 from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 import zipfile
 from pydantic import BaseModel
@@ -133,13 +134,13 @@ def update_category(link_id: int, request: CategoryUpdateRequest, db: Session = 
         return {"error": "Link not found"}
         
     old_cat = link.category
-    link.category = request.category
+    stripped = request.category.strip() if request.category else ""
+    link.category = stripped or None
     
-    # If the file is already downloaded, move it to the new folder
+    # If the file is already downloaded, move it to the final Music/{Language}/{Category} layout
     if link.audio_path and os.path.exists(link.audio_path):
-        import re
-        safe_cat = re.sub(r'[<>:"/\\|?*]', '_', request.category).strip() if request.category else ""
-        new_dir = os.path.join(config.AUDIO_DIRECTORY, safe_cat) if safe_cat else config.AUDIO_DIRECTORY
+        from organizer import resolve_final_path
+        new_dir = resolve_final_path(link)
         os.makedirs(new_dir, exist_ok=True)
         
         filename = os.path.basename(link.audio_path)
@@ -148,6 +149,7 @@ def update_category(link_id: int, request: CategoryUpdateRequest, db: Session = 
         if new_path != link.audio_path:
             shutil.move(link.audio_path, new_path)
             link.audio_path = new_path
+            link.final_path = new_path
             
     db.commit()
     
@@ -190,10 +192,10 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             zip_ref.extractall(extract_dir)
     except zipfile.BadZipFile as e:
         logger.error(f"❌ Uploaded file is not a valid ZIP: {e}")
-        return {"error": "Uploaded file is not a valid ZIP archive. Export the chat as .zip from WhatsApp first."}
+        return JSONResponse(status_code=400, content={"error": "Uploaded file is not a valid ZIP archive. Export the chat as .zip from WhatsApp first."})
     except Exception as e:
         logger.error(f"❌ Failed to extract ZIP: {e}")
-        return {"error": f"Failed to extract ZIP: {e}"}
+        return JSONResponse(status_code=400, content={"error": f"Failed to extract ZIP: {e}"})
     logger.info(f"ZIP extracted to: {extract_dir}")
         
     txt_file = None
@@ -207,7 +209,7 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             
     if not txt_file:
         logger.error("❌ No .txt file found inside the ZIP archive.")
-        return {"error": "No .txt file found in ZIP."}
+        return JSONResponse(status_code=400, content={"error": "No .txt file found in ZIP."})
     
     logger.info(f"Found chat file: {os.path.basename(txt_file)}")
     logger.info("Parsing WhatsApp chat and fetching YouTube metadata...")
@@ -216,6 +218,7 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
     
     saved_count = 0
     duplicate_count = 0
+    unique_count = 0
     senders = set()
     
     seen_in_this_import = set()
@@ -243,6 +246,7 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
             status = "DUPLICATE"
         else:
             status = "PENDING"
+            unique_count += 1
             
         # We save all messages to retain context, but if it's a duplicate video we can mark it
         db_link = Link(
@@ -276,7 +280,7 @@ async def upload_whatsapp_zip(file: UploadFile = File(...), db: Session = Depend
     return {
         "messages_found": len(results),
         "urls_saved": saved_count,
-        "unique_youtube_videos": saved_count - duplicate_count,
+        "unique_youtube_videos": unique_count,
         "senders_found": len(senders)
     }
 
@@ -285,8 +289,24 @@ def verify_link_states(links: List[Link], db: Session):
     for link in links:
         if link.status == "COMPLETED" and link.audio_path:
             if not os.path.exists(link.audio_path):
+                # File vanished: re-queue the whole pipeline (download → transcribe → classify)
+                # so a fresh file is re-transcribed and re-classified, never silently
+                # classified from an empty transcript.
                 link.status = "PENDING"
                 link.audio_path = None
+                link.final_path = None
+                link.transcription_status = "PENDING"
+                link.classification_status = "PENDING"
+                link.ai_language = None
+                link.ai_category = None
+                link.ai_confidence = None
+                link.error = "Audio file missing - queued for re-download"
+                transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
+                if os.path.exists(transcript_path):
+                    try:
+                        os.remove(transcript_path)
+                    except Exception:
+                        pass
                 changed = True
     if changed:
         db.commit()
@@ -368,6 +388,7 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.post("/api/downloads/start")
 async def start_downloads():
     logger.info("▶️ Starting download + AI processor loops...")
+    recover_interrupted_states()
     start_download_loop()
     try:
         from ai_processor import start_ai_processor_loop
@@ -394,7 +415,8 @@ async def pause_downloads():
 @app.get("/api/downloads/status")
 def get_download_status():
     from downloader import download_loop_running
-    return {"is_running": download_loop_running}
+    from ai_processor import processor_loop_running
+    return {"is_running": download_loop_running or processor_loop_running}
 
 @app.post("/api/downloads/retry/{link_id}")
 def retry_download(link_id: int, db: Session = Depends(get_db)):

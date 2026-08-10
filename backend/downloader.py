@@ -165,7 +165,6 @@ def download_audio_safe(url: str, video_id: str, output_dir: str, link_id: int =
 
 async def download_loop():
     global download_loop_running
-    download_loop_running = True
     
     while download_loop_running:
         db: Session = SessionLocal()
@@ -244,6 +243,7 @@ async def download_loop():
 def start_download_loop():
     global download_loop_running
     if not download_loop_running:
+        download_loop_running = True
         asyncio.create_task(download_loop())
 
 def stop_download_loop():

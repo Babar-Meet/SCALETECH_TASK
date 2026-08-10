@@ -4,16 +4,30 @@ from urllib.parse import urlparse, parse_qs
 # Regex to find URLs in text, robust against punctuation
 URL_REGEX = re.compile(r'(https?://[^\s<>"\'\[\]{}|\\^`]+)')
 
+# Trailing punctuation that may wrap a URL in a message and must not be part of it
+# (WhatsApp auto-linkification can add a trailing slash or colon after the ID)
+TRAILING_PUNCT = '.,;!?)":\\]-\u2019\u201d\''
+
 def extract_urls(text: str):
     """Extracts all URLs from a given text."""
     urls = []
     # Find all matches
     for match in URL_REGEX.finditer(text):
         url = match.group(1)
-        # Clean trailing punctuation
-        url = url.rstrip('.,;!?)')
+        # Clean trailing punctuation (repeat so "https://youtu.be/ABC/." still resolves)
+        url = url.rstrip(TRAILING_PUNCT)
         urls.append(url)
     return urls
+
+def _clean_video_id(video_id: str) -> str:
+    """Strips trailing slash/punctuation from a candidate video ID and
+    returns it only when it is a valid 11-char YouTube ID."""
+    if not video_id:
+        return None
+    video_id = video_id.strip('/').rstrip(TRAILING_PUNCT)
+    if len(video_id) == 11 and re.match(r'^[\w-]{11}$', video_id):
+        return video_id
+    return None
 
 def normalize_youtube_url(url: str):
     """
@@ -29,18 +43,22 @@ def normalize_youtube_url(url: str):
         
         # Check if it's a YouTube domain
         if netloc in ('youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'):
-            if path == '/watch':
+            if path.lower() == '/watch':
                 qs = parse_qs(parsed.query)
                 if 'v' in qs:
-                    video_id = qs['v'][0]
+                    video_id = _clean_video_id(qs['v'][0])
             elif path.startswith('/embed/'):
-                video_id = path.split('/')[2]
+                video_id = _clean_video_id(path.split('/')[2])
             elif path.startswith('/shorts/'):
-                video_id = path.split('/')[2]
+                video_id = _clean_video_id(path.split('/')[2])
+            elif path.startswith('/live/'):
+                video_id = _clean_video_id(path.split('/')[2])
+            elif path.startswith('/v/'):
+                video_id = _clean_video_id(path.split('/')[2])
         elif netloc == 'youtu.be':
-            video_id = path.lstrip('/')
+            video_id = _clean_video_id(path.lstrip('/'))
             
-        if video_id and len(video_id) == 11:
+        if video_id:
             normalized = f"https://youtube.com/watch?v={video_id}"
             return normalized, video_id
             

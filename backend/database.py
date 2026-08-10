@@ -9,7 +9,10 @@ db_dir = os.path.dirname(config.DB_PATH)
 if db_dir and not os.path.exists(db_dir):
     os.makedirs(db_dir, exist_ok=True)
 
-engine = create_engine(f"sqlite:///{config.DB_PATH}")
+engine = create_engine(
+    f"sqlite:///{config.DB_PATH}",
+    connect_args={"timeout": 30, "check_same_thread": False},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

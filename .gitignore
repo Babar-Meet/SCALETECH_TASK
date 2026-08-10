@@ -38,3 +38,6 @@ frontend/playwright.config.ts
 .idea/
 .DS_Store
 Thumbs.db
+.env.bak.live
+.playwright-mcp/
+backend/*.log

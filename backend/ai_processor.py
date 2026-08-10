@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import json
 import logging
@@ -104,52 +105,64 @@ Output only a valid JSON object in the exact format:
             "stream": False,
             "format": "json"
         }
-        try:
-            req = urllib.request.Request(url, data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req) as response:
-                resp_data = json.loads(response.read().decode())
-                result = json.loads(resp_data.get('response', '{}'))
-                cat = result.get('category', 'Other')
-                lang = result.get('language', 'Unknown')
-                conf = str(result.get('confidence', '0.0'))
-                logger.info(f"✅ Ollama result: category={cat}, language={lang}, confidence={conf}")
-                return cat, lang, conf
-        except Exception as e:
-            logger.error(f"Ollama failed: {e}")
-            return "Other", "Unknown", "0.0"
+        last_error = None
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(url, data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    resp_data = json.loads(response.read().decode())
+                    result = json.loads(resp_data.get('response', '{}'))
+                    cat = result.get('category', 'Other')
+                    lang = result.get('language', 'Unknown')
+                    conf = str(result.get('confidence', '0.0'))
+                    logger.info(f"✅ Ollama result: category={cat}, language={lang}, confidence={conf}")
+                    return cat, lang, conf
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Ollama attempt {attempt + 1} failed: {e}")
+                time.sleep(2 * (attempt + 1))
+        # Never silently accept garbage: surface the failure so the row is marked FAILED
+        raise Exception(f"Ollama failed after retries: {last_error}")
 
     if config.GEMINI_API_KEY:
         import time
         logger.info(f"Calling Gemini API ({config.GEMINI_MODEL})...")
-        start_time = time.time()
         client = genai.Client(api_key=config.GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model=config.GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-        elapsed = time.time() - start_time
-        logger.info(f"Gemini API returned in {elapsed:.2f} seconds.")
-        
-        try:
-            data = json.loads(response.text)
-            cat = data.get("category", "Other")
-            lang = data.get("language", "Unknown")
-            conf = str(data.get("confidence", "0.0"))
-            logger.info(f"✅ Gemini result: category={cat}, language={lang}, confidence={conf}")
-            return cat, lang, conf
-        except Exception as e:
-            logger.error(f"Failed to parse Gemini response: {e}, raw text: {response.text}")
-            return "Other", "Unknown", "0.0"
+        last_error = None
+        for attempt in range(2):
+            start_time = time.time()
+            try:
+                response = client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
+                elapsed = time.time() - start_time
+                logger.info(f"Gemini API returned in {elapsed:.2f} seconds.")
+                try:
+                    data = json.loads(response.text)
+                    cat = data.get("category", "Other")
+                    lang = data.get("language", "Unknown")
+                    conf = str(data.get("confidence", "0.0"))
+                    logger.info(f"✅ Gemini result: category={cat}, language={lang}, confidence={conf}")
+                    return cat, lang, conf
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Failed to parse Gemini response (attempt {attempt + 1}): {e}, raw text: {response.text}")
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Gemini API call failed (attempt {attempt + 1}): {e}")
+            time.sleep(2 * (attempt + 1))
+        # Never silently accept malformed output: surface the failure so the row is marked FAILED
+        raise Exception(f"Gemini classification failed after retries: {last_error}")
 
     logger.warning("No AI API configured (Gemini or Ollama). Skipping categorization.")
     return "Skipped (No API Key or Local Model)", "Unknown", "0.0"
 
 async def ai_processor_loop():
     global processor_loop_running
-    processor_loop_running = True
     logger.info("AI Processor loop started.")
     
     while processor_loop_running:
@@ -171,11 +184,20 @@ async def ai_processor_loop():
                     await manager.broadcast(json.dumps({"type": "progress", "id": link_to_classify.id, "percent": "AI CATEGORIZING..."}))
                     
                     transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link_to_classify.id}_transcript.txt")
-                    text = ""
-                    if os.path.exists(transcript_path):
-                        with open(transcript_path, 'r', encoding='utf-8') as f:
-                            text = f.read()
-                            
+                    if not os.path.exists(transcript_path):
+                        # The transcript is gone (deleted/moved) even though the row says
+                        # transcription COMPLETED. Re-queue transcription instead of
+                        # classifying an empty text as if it were real content.
+                        logger.warning(f"⚠️ [Link #{link_to_classify.id}] Transcript file missing, re-queueing transcription.")
+                        link_to_classify.transcription_status = "PENDING"
+                        link_to_classify.classification_status = "PENDING"
+                        db.commit()
+                        await manager.broadcast("update")
+                        continue
+                    
+                    with open(transcript_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                        
                     category, ai_lang, confidence = await asyncio.to_thread(
                         categorize_text, text, link_to_classify.audio_title or ""
                     )
@@ -189,19 +211,17 @@ async def ai_processor_loop():
                     link_to_classify.classification_status = "COMPLETED"
                     logger.info(f"✅ Link #{link_to_classify.id} classified: {category} / {ai_lang} (conf: {confidence})")
                     
-                    # Optional: Auto-move file based on ai_category
+                    # Auto-move file to the final Music/{Language}/{Category} layout
                     if link_to_classify.ai_category and link_to_classify.audio_path and os.path.exists(link_to_classify.audio_path):
                         import shutil
-                        import re
-                        
-                        full_lang = link_to_classify.ai_language or 'Unknown'
-                        safe_cat = re.sub(r'[<>:"/\\|?*]', '_', link_to_classify.ai_category).strip()
-                        new_dir = os.path.join(config.AUDIO_DIRECTORY, full_lang, safe_cat)
+                        from organizer import resolve_final_path
+
+                        new_dir = resolve_final_path(link_to_classify)
                         os.makedirs(new_dir, exist_ok=True)
-                        
+
                         filename = os.path.basename(link_to_classify.audio_path)
                         new_path = os.path.join(new_dir, filename)
-                        
+
                         if new_path != link_to_classify.audio_path:
                             shutil.move(link_to_classify.audio_path, new_path)
                             link_to_classify.audio_path = new_path
@@ -223,6 +243,7 @@ async def ai_processor_loop():
                 except Exception as e:
                     logger.error(f"❌ Classification FAILED for Link #{link_to_classify.id}: {e}")
                     link_to_classify.classification_status = "FAILED"
+                    link_to_classify.error = str(e)[:500]
                     db.commit()
                     await manager.broadcast(json.dumps({"type": "progress", "id": link_to_classify.id, "percent": "AI FAILED"}))
                     await manager.broadcast("update")
@@ -236,10 +257,24 @@ async def ai_processor_loop():
             ).first()
             
             if link and not os.path.exists(link.audio_path):
-                # Audio was deleted/moved externally; re-queue the download
+                # Audio was deleted/moved externally; re-queue the download AND the
+                # downstream stages so a fresh file is re-transcribed and re-classified
+                # instead of silently classifying an empty transcript.
                 from websocket_manager import manager
                 link.status = "PENDING"
                 link.error = "Audio file missing - queued for re-download"
+                link.transcription_status = "PENDING"
+                link.classification_status = "PENDING"
+                link.ai_language = None
+                link.ai_category = None
+                link.ai_confidence = None
+                link.final_path = None
+                transcript_path = os.path.join(config.TRANSCRIPTS_DIRECTORY, f"{link.id}_transcript.txt")
+                if os.path.exists(transcript_path):
+                    try:
+                        os.remove(transcript_path)
+                    except Exception:
+                        pass
                 logger.warning(f"⚠️ [Link #{link.id}] Audio file missing ({link.audio_path}), re-queueing download.")
                 db.commit()
                 await manager.broadcast("update")
@@ -275,6 +310,7 @@ async def ai_processor_loop():
                 except Exception as e:
                     logger.error(f"❌ Transcription FAILED for Link #{link.id}: {e}")
                     link.transcription_status = "FAILED"
+                    link.error = str(e)[:500]
                     db.commit()
                     await manager.broadcast(json.dumps({"type": "progress", "id": link.id, "percent": "TRANSCRIPTION FAILED"}))
                     await manager.broadcast("update")
@@ -290,6 +326,7 @@ async def ai_processor_loop():
 def start_ai_processor_loop():
     global processor_loop_running
     if not processor_loop_running:
+        processor_loop_running = True
         asyncio.create_task(ai_processor_loop())
 
 def stop_ai_processor_loop():

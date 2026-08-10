@@ -14,8 +14,8 @@ def export_links_to_excel(links):
     ws.title = "WhatsApp Links"
     
     headers = [
-        "Date", "Sender", "Message", "URL", "Title", "Channel", 
-        "User Category", "AI Category", "AI Confidence", "Language", 
+        "Date", "Sender", "Message", "URL", "YouTube Video ID", "Duration (s)",
+        "Title", "Channel", "User Category", "AI Category", "AI Confidence", "Language",
         "Status", "Local Path"
     ]
     ws.append(headers)
@@ -31,6 +31,8 @@ def export_links_to_excel(links):
             link.sender,
             link.original_message,
             link.extracted_url,
+            link.youtube_video_id or "",
+            link.duration if link.duration is not None else "",
             link.audio_title or "",
             link.channel_name or "",
             link.category or "",
@@ -41,8 +43,8 @@ def export_links_to_excel(links):
             link.audio_path or ""
         ])
         
-    # Wrap text for Message column (C)
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=3, max_col=3):
+    # Wrap text for Message column (D)
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=4, max_col=4):
         for cell in row:
             cell.alignment = Alignment(wrap_text=True)
             
@@ -51,14 +53,16 @@ def export_links_to_excel(links):
     ws.column_dimensions['B'].width = 20
     ws.column_dimensions['C'].width = 40
     ws.column_dimensions['D'].width = 30
-    ws.column_dimensions['E'].width = 30
-    ws.column_dimensions['F'].width = 20
-    ws.column_dimensions['G'].width = 15
-    ws.column_dimensions['H'].width = 15
+    ws.column_dimensions['E'].width = 18
+    ws.column_dimensions['F'].width = 12
+    ws.column_dimensions['G'].width = 30
+    ws.column_dimensions['H'].width = 20
     ws.column_dimensions['I'].width = 15
     ws.column_dimensions['J'].width = 15
     ws.column_dimensions['K'].width = 15
-    ws.column_dimensions['L'].width = 50
+    ws.column_dimensions['L'].width = 15
+    ws.column_dimensions['M'].width = 15
+    ws.column_dimensions['N'].width = 50
     
     # Freeze header
     ws.freeze_panes = "A2"
