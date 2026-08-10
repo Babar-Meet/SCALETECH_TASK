@@ -2,6 +2,7 @@
 backend/venv/
 backend/.env
 .env
+.env.bak.live
 
 # Python
 __pycache__/
@@ -16,28 +17,14 @@ frontend/dist-ssr/
 frontend/.npm/
 *.local
 
-# Application Data (Ignore everything in backend/data)
+# Application data (runtime-generated: audio, transcripts, reports)
 backend/data/
-
-# Stray data when anything runs from project root
 data/
-
-# Test Data provided by user
-test data/
-"test data/"
 temp/
-
-# Local test files (not for the job repo)
-TEST_PLAN.md
-Scripts/run_test_backend.bat
-frontend/e2e/
-frontend/playwright.config.ts
+backend/*.log
 
 # IDEs and OS files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-.env.bak.live
-.playwright-mcp/
-backend/*.log
